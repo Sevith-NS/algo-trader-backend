@@ -1,0 +1,15 @@
+flask
+flask-cors
+yfinance
+pandas
+numpy
+scipy
+requests
+xgboost
+scikit-learn
+vaderSentiment
+feedparser
+prophet
+google-generativeai
+python-dotenv
+plotly

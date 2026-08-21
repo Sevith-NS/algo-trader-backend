@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+.ca-bundle.pem
+.market_cache.json
+# Generated India market caches: rebuilt on demand from the NSE index archives
+# and the Groww instrument master. Snapshots, not source.
+.nse_segments.json
+.groww_instruments.json
+.env*
+!.env.example
+# macOS Finder metadata
+.DS_Store
