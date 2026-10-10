@@ -339,6 +339,35 @@ def journal_delete(entry_id: str) -> bool:
     return removed
 
 
+class FileJournalStore:
+    """Journal storage the desk reads and writes through.
+
+    This default keeps the local JSON file (CLI runs and tests). The API passes
+    a per-user database store with the same three methods instead, so each
+    user's desk remembers only that user's decisions.
+    """
+
+    def entries(self) -> list:
+        with _journal_lock:
+            return _journal_read()["entries"]
+
+    def append(self, entry: dict) -> dict:
+        return journal_append(entry)
+
+    def save_outcomes(self, outcomes: dict) -> None:
+        # Re-read under the lock and merge by id: a concurrent run may have
+        # appended a new decision since the caller's snapshot.
+        with _journal_lock:
+            fresh = _journal_read()
+            for e in fresh["entries"]:
+                if e.get("id") in outcomes:
+                    e["outcome"] = outcomes[e["id"]]
+            _journal_write(fresh)
+
+
+_FILE_STORE = FileJournalStore()
+
+
 def _grade(action: str, decision: str, alpha: float) -> tuple:
     """Grade a decision on alpha, not raw return - beating the tape is the bar.
 
@@ -385,14 +414,14 @@ def _return_since(series, since_ts: float):
         return None
 
 
-def journal_score(force: bool = False) -> dict:
+def journal_score(force: bool = False, store=None) -> dict:
     """Attach realized outcomes to journal entries old enough to judge.
 
     Price history is pulled through data_source's cache, so re-scoring the same
     names on a page refresh costs nothing upstream.
     """
-    with _journal_lock:
-        entries = _journal_read()["entries"]
+    store = store or _FILE_STORE
+    entries = store.entries()
 
     now = time.time()
     pending = []
@@ -440,17 +469,9 @@ def journal_score(force: bool = False) -> dict:
         scored += 1
 
     if scored:
-        # Re-read under the lock and merge by id: a concurrent run may have
-        # appended a new decision since the snapshot above.
-        with _journal_lock:
-            fresh = _journal_read()
-            scored_by_id = {e["id"]: e["outcome"] for e in pending
-                            if e.get("id") and e.get("outcome")}
-            for e in fresh["entries"]:
-                if e.get("id") in scored_by_id:
-                    e["outcome"] = scored_by_id[e["id"]]
-            _journal_write(fresh)
-            entries = fresh["entries"]
+        store.save_outcomes({e["id"]: e["outcome"] for e in pending
+                             if e.get("id") and e.get("outcome")})
+        entries = store.entries()
 
     return {"scored": scored, "entries": entries}
 
@@ -473,12 +494,12 @@ def _memory_line(e: dict) -> str:
             f"conviction {e.get('conviction_10', '?')}/10 -> {result}")
 
 
-def load_memory(symbol: str, same_limit: int = 4, lesson_limit: int = 3) -> dict:
+def load_memory(symbol: str, same_limit: int = 4, lesson_limit: int = 3, store=None) -> dict:
     """Past decisions on this name, plus recent misses elsewhere as lessons."""
     try:
-        entries = journal_score()["entries"]
+        entries = journal_score(store=store)["entries"]
     except Exception:
-        entries = _journal_read()["entries"]
+        entries = (store or _FILE_STORE).entries()
 
     same = sorted([e for e in entries if e.get("symbol") == symbol],
                   key=lambda e: e.get("ts", 0), reverse=True)[:same_limit]
@@ -558,8 +579,8 @@ def journal_stats(entries: list) -> dict:
     }
 
 
-def get_journal(symbol: str | None = None, limit: int = 60) -> dict:
-    result = journal_score()
+def get_journal(symbol: str | None = None, limit: int = 60, store=None) -> dict:
+    result = journal_score(store=store)
     entries = result["entries"]
     stats = journal_stats(entries)
     view = [e for e in entries if not symbol or e.get("symbol") == symbol]
@@ -1383,7 +1404,8 @@ def _context_event(run_id: str, ctx: dict, rounds: int, memory: dict) -> dict:
     }
 
 
-def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_ROUNDS):
+def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_ROUNDS,
+             store=None):
     """Run the full desk, yielding one event dict per agent turn.
 
     The caller decides the transport: the Flask route wraps these as SSE frames
@@ -1417,7 +1439,7 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
         return
 
     try:
-        memory = load_memory(symbol)
+        memory = load_memory(symbol, store=store)
     except Exception:
         memory = {"block": "MEMORY: unavailable.", "same_ticker": [], "lessons": []}
 
@@ -1545,10 +1567,12 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
         "levels": trade.get("levels"),
         "outcome": None,
     }
+    store = store or _FILE_STORE
     try:
-        journal_append(entry)
-        stats = journal_stats(_journal_read()["entries"])
+        store.append(entry)
+        stats = journal_stats(store.entries())
     except Exception:
+        logging.getLogger(__name__).exception("journal write failed")
         stats = None
     yield {"type": "journal", "entry": entry, "stats": stats}
 
@@ -1563,10 +1587,10 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
 
 
 def run_desk_sync(symbol: str, portfolio: dict | None = None,
-                  rounds: int = DEFAULT_ROUNDS) -> dict:
+                  rounds: int = DEFAULT_ROUNDS, store=None) -> dict:
     """Collect a full run into one payload, for callers that cannot stream."""
     result = {"analysts": [], "debate": [], "risk": []}
-    for event in run_desk(symbol, portfolio=portfolio, rounds=rounds):
+    for event in run_desk(symbol, portfolio=portfolio, rounds=rounds, store=store):
         kind = event.get("type")
         if kind == "analyst":
             result["analysts"].append(event)

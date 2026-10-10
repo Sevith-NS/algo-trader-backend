@@ -7,10 +7,11 @@ all: a browser on another origin gets no permission to read responses.
 Run locally:  uvicorn flint_api.main:app --port 5000
 """
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import errors
+from . import db, errors
 from .middleware import RedactSecrets, RequestContext
 from .security import Principal, current_user
 from .settings import settings
@@ -26,11 +27,18 @@ def _configure_logging() -> None:
         handler.addFilter(redact)
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    yield
+    db.close()
+
+
 def create_app() -> FastAPI:
     _configure_logging()
     app = FastAPI(
         title="Flint API",
         version="2.0.0",
+        lifespan=_lifespan,
         # No public schema or docs UI: the API surface is not advertised.
         openapi_url=None, docs_url=None, redoc_url=None,
     )

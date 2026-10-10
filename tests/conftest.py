@@ -44,6 +44,13 @@ def auth(sub: str = "user_test_a", **kw) -> dict:
     return {"Authorization": f"Bearer {make_token(sub, **kw)}"}
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _close_pool():
+    yield
+    from flint_api import db
+    db.close()
+
+
 @pytest.fixture()
 def client():
     from fastapi.testclient import TestClient

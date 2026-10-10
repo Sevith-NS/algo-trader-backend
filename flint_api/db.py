@@ -32,12 +32,22 @@ def pool() -> ConnectionPool:
     return _pool
 
 
+_known_users: set[str] = set()
+
+
 @contextmanager
 def user_tx(user_id: str) -> Iterator[psycopg.Connection]:
     with pool().connection() as conn:
         with conn.transaction():
             conn.execute("select set_config('app.user_id', %s, true)", (user_id,))
+            if user_id not in _known_users:
+                ensure_user(conn, user_id)
+                _known_users.add(user_id)
             yield conn
+
+
+def forget_user(user_id: str) -> None:
+    _known_users.discard(user_id)
 
 
 def ensure_user(conn: psycopg.Connection, user_id: str) -> None:

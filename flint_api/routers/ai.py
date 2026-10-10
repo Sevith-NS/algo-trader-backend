@@ -11,6 +11,7 @@ import llm_router
 from ..errors import Unavailable
 from ..ratelimit import limit
 from ..security import Principal, require_admin
+from ..stores import DbJournalStore
 from ..validators import Symbol
 from ._common import sse
 
@@ -62,11 +63,15 @@ def ai_chat(body: ChatBody):
     return result
 
 
-@router.post("/agents/run", dependencies=[Depends(limit("agents"))])
-def agents_run(body: DeskBody):
+@router.post("/agents/run")
+def agents_run(body: DeskBody, user: Principal = Depends(limit("agents"))):
+    # The desk remembers and journals only this user's decisions.
+    store = DbJournalStore(user.user_id)
     if not body.stream:
-        return agents_desk.run_desk_sync(body.symbol, portfolio=body.portfolio, rounds=body.rounds)
-    return sse(agents_desk.run_desk(body.symbol, portfolio=body.portfolio, rounds=body.rounds))
+        return agents_desk.run_desk_sync(body.symbol, portfolio=body.portfolio,
+                                         rounds=body.rounds, store=store)
+    return sse(agents_desk.run_desk(body.symbol, portfolio=body.portfolio,
+                                    rounds=body.rounds, store=store))
 
 
 @router.get("/agents/routing")

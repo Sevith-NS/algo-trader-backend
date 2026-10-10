@@ -1,7 +1,8 @@
 """Route modules. Each exposes `router`; `register` mounts them all under /api."""
 from fastapi import FastAPI
 
-_MODULES: list[str] = ["market", "symbol", "news", "portfolio", "backtest", "ai"]
+_MODULES: list[str] = ["market", "symbol", "news", "portfolio", "backtest", "ai",
+                     "me", "ledger", "watchlists", "journal"]
 
 
 def register(app: FastAPI) -> None:
