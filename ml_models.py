@@ -106,10 +106,9 @@ def get_ml_insights(symbol):
             "current_price": last_close,
             "fear_greed_index": fear_greed_index
         }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "The forecast is unavailable for this symbol right now."}
 
 def get_advanced_signals(symbol):
     try:
@@ -167,10 +166,9 @@ def get_advanced_signals(symbol):
             "atr": atr,
             "sma_20": sma_20
         }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "The forecast is unavailable for this symbol right now."}
 
 import scipy.optimize as sco
 
@@ -241,7 +239,6 @@ def portfolio_optimization(symbols):
             "asset_details": capm_returns
         }
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "The forecast is unavailable for this symbol right now."}

@@ -16,9 +16,11 @@ No auth bypass or scraping tricks — standard public JSON endpoints, browser UA
 low request volume.
 """
 import os
+import heapq
 import json
 import time
 import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import pandas as pd
@@ -97,10 +99,22 @@ def _load_disk() -> dict:
 _disk_cache = _load_disk()
 
 
-def _save_disk():
+# Bounds for the shared cache (audit finding 5). Keys are symbol-derived, so
+# without a cap the store, and the file dumped on every write, grew with every
+# distinct symbol ever requested; the dump also ran under the read lock.
+_MAX_CACHE_ENTRIES = 5000
+_SAVE_EVERY = 5.0  # seconds between whole-file dumps
+_save_state = {"ts": 0.0}
+_save_lock = threading.Lock()
+
+
+def _save_disk(snapshot: dict):
+    """Write a snapshot atomically: a crash mid-write never truncates the cache."""
+    tmp = CACHE_FILE + ".tmp"
     try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(_disk_cache, f)
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, CACHE_FILE)
     except Exception:
         pass
 
@@ -120,10 +134,22 @@ def _cache_get(key: str, fresh_ttl: float):
 
 def _cache_put(key: str, data):
     entry = {"ts": time.time(), "data": data}
+    snapshot = None
     with _cache_lock:
         _mem_cache[key] = entry
         _disk_cache[key] = entry
-        _save_disk()
+        if len(_disk_cache) > _MAX_CACHE_ENTRIES:
+            excess = len(_disk_cache) - _MAX_CACHE_ENTRIES
+            for old in heapq.nsmallest(excess, _disk_cache, key=lambda k: _disk_cache[k]["ts"]):
+                _disk_cache.pop(old, None)
+                _mem_cache.pop(old, None)
+        if entry["ts"] - _save_state["ts"] >= _SAVE_EVERY:
+            _save_state["ts"] = entry["ts"]
+            snapshot = dict(_disk_cache)
+    # Serialise outside the read lock so a dump never stalls cache readers.
+    if snapshot is not None:
+        with _save_lock:
+            _save_disk(snapshot)
 
 
 def _throttled(fn):
@@ -179,27 +205,27 @@ def _breaker_record(ok: bool):
 # key (screener fires 5 endpoints for one symbol; holdings-intel fans out),
 # only the first hits the network — the rest wait on the key's lock, then
 # re-read the now-warm cache. Classic cache-stampede protection.
-# Keys derive from user input (symbols), so idle locks are pruned to bound
-# memory; a pruned-and-recreated lock can at worst double-fetch a key idle
-# for 15+ minutes, which is a perf hiccup, not a correctness issue.
-_flight_locks: dict = {}
-_flight_last: dict = {}
+# Keys derive from user input (symbols), so the table is an LRU with a hard
+# cap: once full, the least recently used idle lock is evicted in O(1). The
+# old age-only prune could never evict under sustained traffic (audit finding
+# 10). A recreated lock can at worst double-fetch one key, never corrupt it.
+_flight_locks: "OrderedDict[str, threading.Lock]" = OrderedDict()
 _flight_guard = threading.Lock()
-_FLIGHT_STALE = 900  # seconds
-_FLIGHT_PRUNE_ABOVE = 256  # only bother pruning past this many keys
+_FLIGHT_MAX_KEYS = 512
 
 
 @contextmanager
 def _singleflight(key: str):
-    now = time.monotonic()
     with _flight_guard:
-        if len(_flight_locks) > _FLIGHT_PRUNE_ABOVE:
-            for k in [k for k, ts in _flight_last.items()
-                      if now - ts > _FLIGHT_STALE and not _flight_locks[k].locked()]:
-                _flight_locks.pop(k, None)
-                _flight_last.pop(k, None)
-        lock = _flight_locks.setdefault(key, threading.Lock())
-        _flight_last[key] = now
+        lock = _flight_locks.get(key)
+        if lock is None:
+            lock = _flight_locks[key] = threading.Lock()
+            # Evict idle locks oldest-first; an in-flight lock is never dropped.
+            for old in list(_flight_locks)[:max(0, len(_flight_locks) - _FLIGHT_MAX_KEYS)]:
+                if old != key and not _flight_locks[old].locked():
+                    del _flight_locks[old]
+        else:
+            _flight_locks.move_to_end(key)
     with lock:
         yield
 

@@ -43,6 +43,7 @@ is clamped to a closed set and every number to a sane range before it can reach
 the UI or a position-size calculation.
 """
 import json
+import logging
 import math
 import os
 import random
@@ -131,7 +132,8 @@ def _friendly_error(exc) -> str:
         return "Gemini was briefly unavailable, so this seat could not file."
     if isinstance(exc, (json.JSONDecodeError, ValueError)):
         return "The model returned a response this seat could not parse."
-    return msg[:200]
+    logging.getLogger(__name__).warning("desk seat failed: %s", msg[:500])
+    return "This seat could not file because of an unexpected error."
 
 
 # Bench key for this backend's Gemini quota. Shared by every desk seat, so one
@@ -462,11 +464,13 @@ def _memory_line(e: dict) -> str:
                   f"= alpha {o['alpha_pct']:+.1f}% -> {o['grade']}")
     else:
         result = "outcome not yet known"
-    thesis = _text(e.get("thesis"), 260)
+    # Structured fields only. The stored thesis is prior model prose, and this
+    # block sits outside DATA, where the grounding rule's untrusted-text clause
+    # does not reach (audit finding 4). The thesis still travels inside DATA via
+    # load_memory's slim() records, which that rule does cover.
     return (f"[{e.get('symbol')}] {when} ({age}) {e.get('decision')} {e.get('action')} "
             f"at {_num(e.get('size_pct'), 0, 100):.1f}% size, "
-            f"conviction {e.get('conviction_10', '?')}/10 -> {result}\n"
-            f"    thesis was: {thesis}")
+            f"conviction {e.get('conviction_10', '?')}/10 -> {result}")
 
 
 def load_memory(symbol: str, same_limit: int = 4, lesson_limit: int = 3) -> dict:
@@ -568,8 +572,9 @@ def get_journal(symbol: str | None = None, limit: int = 60) -> dict:
 def _safe(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
-    except Exception as exc:  # one dead engine must not sink the desk
-        return {"error": str(exc)}
+    except Exception:  # one dead engine must not sink the desk
+        logging.getLogger(__name__).exception("desk data source failed")
+        return {"error": "This data source is unavailable right now."}
 
 
 def _ok(payload) -> bool:
@@ -1508,8 +1513,9 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
     except DeskUnavailable as exc:
         yield {"type": "error", "message": str(exc)}
         return
-    except Exception as exc:
-        yield {"type": "error", "message": f"The desk stalled: {exc}"}
+    except Exception:
+        logging.getLogger(__name__).exception("desk run failed")
+        yield {"type": "error", "message": "The desk stalled on an unexpected error. Try again."}
         return
 
     # ---- 7. journal the decision so the next run can be told how it went ----

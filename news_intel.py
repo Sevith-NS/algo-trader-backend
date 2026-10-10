@@ -51,6 +51,7 @@ _analyzer.lexicon.update({
 
 _cache: dict = {}
 CACHE_TTL = 600  # 10 min per symbol
+_CACHE_MAX = 1000
 
 
 def _is_indian(symbol: str) -> bool:
@@ -203,5 +204,11 @@ def get_news_intel(symbol: str, max_total: int = 30) -> dict:
         "breakdown": {"bullish": bull, "bearish": bear, "neutral": n - bull - bear},
         "generated_at": now_ts,
     }
+    # Evict on write, the only place keys enter (audit finding 9): drop what the
+    # TTL already forbids serving, then hold a hard cap for bursts within a TTL.
+    for stale in [k for k, v in _cache.items() if now - v["ts"] >= CACHE_TTL]:
+        _cache.pop(stale, None)
+    while len(_cache) >= _CACHE_MAX:
+        _cache.pop(next(iter(_cache)))
     _cache[symbol] = {"ts": now, "data": data}
     return data

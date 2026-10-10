@@ -20,3 +20,10 @@ prophet==1.4.0
 google-genai==2.19.0
 python-dotenv==1.2.3
 plotly==6.9.0
+# Flint API (FastAPI) - Clerk auth, Neon Postgres, tests
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+pyjwt[crypto]==2.15.1
+psycopg[binary,pool]==3.3.6
+psycopg-pool==3.3.3
+pytest==9.1.1

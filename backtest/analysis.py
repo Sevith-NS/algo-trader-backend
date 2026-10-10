@@ -17,6 +17,7 @@ whole sweep once per fold.
 from __future__ import annotations
 
 import itertools
+import math
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,26 @@ from .errors import BacktestError
 
 
 # ------------------------------------------------------------ parameter grid
+
+# Mirrors service.MAX_COMBOS. Checked while lo/hi/step are still scalars, so an
+# oversized grid is refused before np.arange or itertools.product allocates it
+# (audit finding 3: the old cap ran only after the allocation it guarded).
+MAX_POINTS = 2000
+
+
+def _range_values(lo: float, hi: float, step: float, key: str):
+    if not all(math.isfinite(x) for x in (lo, hi, step)):
+        raise BacktestError(f'Range for "{key}" must be finite numbers.')
+    if step <= 0:
+        raise BacktestError(f'Step for "{key}" must be positive.')
+    points = math.floor((hi - lo) / step + 0.5) + 1
+    if points < 1:
+        raise BacktestError(f'Range for "{key}" covers no values.')
+    if points > MAX_POINTS:
+        raise BacktestError(
+            f'Range for "{key}" is {points:,} values; the cap is {MAX_POINTS:,}. Widen the step.')
+    return np.arange(lo, hi + step / 2, step)
+
 
 def parse_grid(spec) -> dict:
     """Accepts the CLI string form or an already-expanded mapping.
@@ -42,9 +63,7 @@ def parse_grid(spec) -> dict:
             elif isinstance(value, dict):
                 lo, hi = float(value["min"]), float(value["max"])
                 step = float(value.get("step") or 1)
-                if step <= 0:
-                    raise BacktestError(f'Step for "{key}" must be positive.')
-                grid[key] = [_num(v) for v in np.arange(lo, hi + step / 2, step)]
+                grid[key] = [_num(v) for v in _range_values(lo, hi, step, key)]
             else:
                 grid[key] = [_num(value)]
             if not grid[key]:
@@ -63,9 +82,7 @@ def parse_grid(spec) -> dict:
             raise BacktestError(f'Sweep values for "{key}" must be numbers.')
         if len(bits) == 3:
             lo, hi, step = bits
-            if step <= 0:
-                raise BacktestError(f'Step for "{key}" must be positive.')
-            values = list(np.arange(lo, hi + step / 2, step))
+            values = list(_range_values(lo, hi, step, key.strip()))
         else:
             values = bits
         grid[key.strip()] = [_num(v) for v in values]
@@ -79,6 +96,11 @@ def _num(v):
 
 def combinations(grid: dict) -> list:
     keys = list(grid)
+    total = math.prod(len(grid[k]) for k in keys)
+    if total > MAX_POINTS:
+        raise BacktestError(
+            f"That grid is {total:,} combinations; the cap is {MAX_POINTS:,}. "
+            f"Widen the step or sweep fewer parameters.")
     return [dict(zip(keys, combo))
             for combo in itertools.product(*[grid[k] for k in keys])]
 

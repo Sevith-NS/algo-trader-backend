@@ -8,6 +8,7 @@ in real numbers instead of hallucinating prices.
 """
 import os
 import json
+import logging
 
 from dotenv import load_dotenv
 from google import genai
@@ -18,6 +19,11 @@ import news_engine
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Bounds on what one chat request can send to the billed model (audit finding 2).
+_MAX_HISTORY = 20
+_MAX_MESSAGE_CHARS = 4000
+_MAX_PORTFOLIO_CHARS = 4000
 _client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 MODEL = "gemini-3.6-flash"
@@ -40,7 +46,8 @@ Rules:
 def _build_context(portfolio: dict, symbol: str | None) -> str:
     parts = []
     if portfolio:
-        parts.append("USER PORTFOLIO SNAPSHOT:\n" + json.dumps(portfolio, indent=2))
+        # Bounded and compact: every character here is billed (audit finding 2).
+        parts.append("USER PORTFOLIO SNAPSHOT:\n" + json.dumps(portfolio, default=str)[:_MAX_PORTFOLIO_CHARS])
     if symbol:
         try:
             signals = quant_models.get_quant_signals(symbol)
@@ -65,21 +72,21 @@ def _build_context(portfolio: dict, symbol: str | None) -> str:
 
 def chat(messages: list, portfolio: dict | None = None, symbol: str | None = None):
     if not GEMINI_API_KEY:
-        return {"error": "GEMINI_API_KEY not found in environment variables. Add it to your .env file."}
+        return {"error": "The assistant isn't configured yet."}
 
     try:
         context = _build_context(portfolio or {}, symbol)
 
         # Gemini uses 'model' for assistant turns
         history = []
-        for m in messages[:-1]:
+        for m in messages[-_MAX_HISTORY:-1]:
             role = "model" if m.get("role") == "assistant" else "user"
             history.append(types.Content(
                 role=role,
-                parts=[types.Part.from_text(text=m.get("content", ""))],
+                parts=[types.Part.from_text(text=(m.get("content") or "")[:_MAX_MESSAGE_CHARS])],
             ))
 
-        last_user = messages[-1].get("content", "") if messages else ""
+        last_user = (messages[-1].get("content") or "")[:_MAX_MESSAGE_CHARS] if messages else ""
         prompt = f"CONTEXT (live data, cite from here):\n{context}\n\nUSER QUESTION:\n{last_user}"
 
         session = _client.chats.create(
@@ -90,7 +97,6 @@ def chat(messages: list, portfolio: dict | None = None, symbol: str | None = Non
         response = session.send_message(prompt)
 
         return {"reply": response.text}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("assistant chat failed")
+        return {"error": "The assistant is unavailable right now. Try again in a moment."}

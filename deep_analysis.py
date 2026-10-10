@@ -22,6 +22,7 @@ Three layers, each honest about what it is:
      context — never as invented figures or dates.
 """
 import json
+import logging
 import os
 
 import numpy as np
@@ -446,6 +447,7 @@ def get_holdings_intel(positions: list) -> dict:
                                  if top else None),
                 "verdict": verdict,
             })
-        except Exception as e:
-            out.append({"symbol": sym, "error": str(e)})
+        except Exception:
+            logging.getLogger(__name__).exception("holdings intel failed for one symbol")
+            out.append({"symbol": sym, "error": "Intel is unavailable for this holding right now."})
     return {"holdings": out}
