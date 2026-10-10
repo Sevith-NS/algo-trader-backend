@@ -39,7 +39,10 @@ def get_portfolio_analytics(positions: list, balance: float = 0.0):
                 prices[sym] = float(p.get("averagePrice", 0))
             sectors[sym] = data_source.get_sector(sym)
 
-        values = {p["symbol"]: p["shares"] * prices[p["symbol"]] for p in positions}
+        # fx_rate converts each holding into one base currency, so weights and
+        # money figures are comparable across a mixed-currency book.
+        values = {p["symbol"]: p["shares"] * prices[p["symbol"]] * float(p.get("fx_rate") or 1.0)
+                  for p in positions}
         invested = sum(values.values())
         total_equity = invested + balance
         if invested <= 0:

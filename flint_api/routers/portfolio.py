@@ -24,11 +24,22 @@ class Position(BaseModel):
     symbol: Symbol
     shares: Annotated[float, Field(gt=0, le=1e9)]
     averagePrice: Annotated[float, Field(ge=0, le=1e9)] = 0.0
+    # Converts the holding's currency into the account currency (default: same).
+    fx_rate: Annotated[float, Field(gt=0, le=1e6)] = 1.0
 
 
 class PositionsBody(BaseModel):
     positions: Annotated[list[Position], Field(min_length=1, max_length=MAX_SYMBOLS_PER_REQUEST)]
     balance: Annotated[float, Field(ge=0, le=1e12)] = 0.0
+
+
+class HoldingRef(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    symbol: Symbol
+
+
+class HoldingsBody(BaseModel):
+    positions: Annotated[list[HoldingRef], Field(min_length=1, max_length=MAX_SYMBOLS_PER_REQUEST)]
 
 
 class SymbolsBody(BaseModel):
@@ -47,5 +58,5 @@ def portfolio_optimization(body: SymbolsBody):
 
 
 @router.post("/holdings-intel", dependencies=[Depends(limit("expensive"))])
-def holdings_intel(body: PositionsBody):
+def holdings_intel(body: HoldingsBody):
     return deep_analysis.get_holdings_intel([p.model_dump() for p in body.positions])

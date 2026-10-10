@@ -122,12 +122,13 @@ def positions(account_id: UUID, user: Principal = Depends(limit("standard"))):
         row = {"symbol": symbol, "quantity": str(p["quantity"].normalize()), "currency": p["currency"],
                "avg_cost": _money(p["cost"] / p["quantity"]), "cost_basis": _money(p["cost"]),
                "realized_pnl": _money(p["realized"]),
-               "last_price": None, "market_value": None, "unrealized_pnl": None, "price_unavailable": False}
+               "last_price": None, "fx_rate": None, "market_value": None, "unrealized_pnl": None, "price_unavailable": False}
         if len(open_positions) < _MAX_QUOTED_POSITIONS:
             try:
                 price, ccy = _live_price(symbol)
-                value = p["quantity"] * price * _fx(ccy, base)
-                row.update(last_price=str(price), market_value=_money(value),
+                rate = _fx(ccy, base)
+                value = p["quantity"] * price * rate
+                row.update(last_price=str(price), fx_rate=str(rate), market_value=_money(value),
                            unrealized_pnl=_money(value - p["cost"]))
             except Unavailable:
                 row["price_unavailable"] = True

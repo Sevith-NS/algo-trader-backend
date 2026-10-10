@@ -126,3 +126,22 @@ def test_singleflight_table_is_bounded():
         with data_source._singleflight(f"sym{i}"):
             pass
     assert len(data_source._flight_locks) <= data_source._FLIGHT_MAX_KEYS
+
+
+def test_risk_weights_use_base_currency(monkeypatch):
+    """A 1,000-share INR holding must not outweigh a USD holding worth more."""
+    import numpy as np
+    import pandas as pd
+    import data_source
+    import risk_analytics
+    idx = pd.bdate_range("2025-01-01", periods=120)
+    rng = np.random.default_rng(1)
+    series = {s: pd.Series(100 * np.cumprod(1 + rng.normal(0, 0.01, len(idx))), index=idx)
+              for s in ("RELIANCE.NS", "AAPL", "^GSPC")}
+    monkeypatch.setattr(data_source, "get_close_series", lambda s, _r: series[s])
+    monkeypatch.setattr(data_source, "get_sector", lambda s: "Other")
+    out = risk_analytics.get_portfolio_analytics([
+        {"symbol": "RELIANCE.NS", "shares": 10, "averagePrice": 0, "fx_rate": 1.0},   # ~1,000 INR
+        {"symbol": "AAPL", "shares": 10, "averagePrice": 0, "fx_rate": 85.0},         # ~85,000 INR
+    ], 0)
+    assert out["weights"]["AAPL"] > 0.95
