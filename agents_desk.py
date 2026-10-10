@@ -1408,7 +1408,7 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
              store=None):
     """Run the full desk, yielding one event dict per agent turn.
 
-    The caller decides the transport: the Flask route wraps these as SSE frames
+    The caller decides the transport: the API route wraps these as SSE frames
     so the debate lands in the UI turn by turn instead of after 40 seconds of
     blank screen, and run_desk_sync() collects them into one payload.
     """

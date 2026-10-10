@@ -3,10 +3,7 @@
 # so the environment was neither reproducible nor auditable against a CVE
 # feed. Bump deliberately, then re-run the test_*.py suites.
 #
-# Run with `./run.sh` (or `python app.py`). gunicorn is not listed: it is a
-# deployment concern, not an application dependency.
-flask==3.1.3
-flask-cors==6.0.5
+# Run with `./run.sh` (uvicorn flint_api.main:app).
 yfinance==1.6.0
 pandas==3.0.5
 numpy==2.5.2
@@ -19,7 +16,6 @@ feedparser==6.0.14
 prophet==1.4.0
 google-genai==2.19.0
 python-dotenv==1.2.3
-plotly==6.9.0
 # Flint API (FastAPI) - Clerk auth, Neon Postgres, tests
 fastapi==0.143.0
 uvicorn[standard]==0.54.0

@@ -1,4 +1,4 @@
-"""Request -> backtest -> JSON. The layer the Flask routes talk to.
+"""Request -> backtest -> JSON. The layer the API routes talk to.
 
 Everything the desktop tester's run.py did between parsing argv and printing a
 rich table happens here, minus the printing: pick the engine the strategy
