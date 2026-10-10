@@ -46,3 +46,9 @@ graphify-out/
 .DS_Store
 Thumbs.db
 *.log
+.neon
+node_modules/
+
+# Agent tooling installed locally by `neon skills`
+.claude/
+skills-lock.json
