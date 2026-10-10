@@ -1,6 +1,6 @@
 """One error contract for the whole API.
 
-Every failure is JSON shaped `{"error": {"code", "message", "ref"?}}`.
+Every failure is JSON shaped `{"error": "<message>", "code": "...", "ref"?, "fields"?}`.
 Messages written here are safe to show a user. Unexpected exceptions never
 reach the client: they are logged with a reference id, and the client gets
 that id plus a fixed message, so support can find the log line without the
@@ -58,10 +58,10 @@ class Unavailable(AppError):
 
 
 def _body(code: str, message: str, ref: str | None = None) -> dict:
-    err = {"code": code, "message": message}
+    body = {"error": message, "code": code}
     if ref:
-        err["ref"] = ref
-    return {"error": err}
+        body["ref"] = ref
+    return body
 
 
 def install(app: FastAPI) -> None:
@@ -79,7 +79,7 @@ def install(app: FastAPI) -> None:
             for e in exc.errors()
         ]
         body = _body("invalid_request", "Some fields are invalid.")
-        body["error"]["fields"] = fields
+        body["fields"] = fields
         return JSONResponse(body, status_code=422)
 
     @app.exception_handler(StarletteHTTPException)

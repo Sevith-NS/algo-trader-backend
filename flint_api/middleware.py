@@ -37,8 +37,7 @@ class RequestContext:
 
         declared = dict(scope.get("headers", [])).get(b"content-length")
         if declared is not None and declared.isdigit() and int(declared) > self.max_body:
-            return await _send_json(send, 413, request_id, {"error": {
-                "code": "too_large", "message": "Request body is too large."}})
+            return await _send_json(send, 413, request_id, {"error": "Request body is too large.", "code": "too_large"})
 
         received = 0
         started = False
@@ -71,15 +70,14 @@ class RequestContext:
         except _BodyTooLarge:
             if not started:
                 await _send_json(send, 413, request_id,
-                                 {"error": {"code": "too_large", "message": "Request body is too large."}})
+                                 {"error": "Request body is too large.", "code": "too_large"})
         except Exception:
             # Unexpected failure: log the cause against the request id and give
             # the client only that id. Handled here, inside this middleware, so
             # the 500 still carries the security headers.
             log.exception("unhandled error ref=%s path=%s", request_id, scope.get("path"))
             if not started:
-                await _send_json(send, 500, request_id, {"error": {
-                    "code": "internal", "message": INTERNAL_MESSAGE, "ref": request_id}})
+                await _send_json(send, 500, request_id, {"error": INTERNAL_MESSAGE, "code": "internal", "ref": request_id})
 
 
 class _BodyTooLarge(Exception):

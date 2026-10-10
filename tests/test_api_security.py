@@ -13,7 +13,7 @@ def test_health_is_public(client):
 def test_missing_token_is_401(client):
     r = client.get("/api/session")
     assert r.status_code == 401
-    assert r.json()["error"]["code"] == "unauthorized"
+    assert r.json()["code"] == "unauthorized"
 
 
 def test_valid_token_identifies_user(client):
@@ -70,7 +70,7 @@ def test_security_headers_and_no_cors(client):
 
 def test_unknown_route_is_json_404(client):
     r = client.get("/api/nope", headers=auth())
-    assert r.status_code == 404 and r.json()["error"]["code"] == "not_found"
+    assert r.status_code == 404 and r.json()["code"] == "not_found"
 
 
 def test_oversized_body_is_413(client):

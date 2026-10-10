@@ -103,9 +103,9 @@ def test_cannot_overspend_or_oversell(client, users, quotes):
     a, _ = users
     acct = _onboard(client, a, cash="1000")
     r = _order(client, a, acct, "AAPL", "buy", 1)  # 17000 INR > 1000
-    assert r.status_code == 400 and "Not enough paper cash" in r.json()["error"]["message"]
+    assert r.status_code == 400 and "Not enough paper cash" in r.json()["error"]
     r = _order(client, a, acct, "RELIANCE.NS", "sell", 1)
-    assert r.status_code == 400 and "Short selling" in r.json()["error"]["message"]
+    assert r.status_code == 400 and "Short selling" in r.json()["error"]
 
 
 def test_duplicate_submit_fills_once(client, users, quotes):

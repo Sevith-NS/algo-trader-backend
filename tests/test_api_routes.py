@@ -33,7 +33,7 @@ def test_real_symbols_are_accepted(client, stub, symbol):
 def test_malformed_symbols_are_rejected_before_engines(client, stub, symbol):
     r = client.get("/api/quote", params={"symbol": symbol}, headers=auth())
     assert r.status_code == 422
-    body = r.json()["error"]
+    body = r.json()
     assert body["code"] == "invalid_request"
     assert symbol not in str(body) or symbol == ""  # input is never echoed back
 
@@ -41,7 +41,7 @@ def test_malformed_symbols_are_rejected_before_engines(client, stub, symbol):
 def test_engine_error_payload_becomes_503(client, stub):
     r = client.get("/api/quant-signals", params={"symbol": "AAPL"}, headers=auth())
     assert r.status_code == 503
-    assert r.json()["error"]["message"] == "Signals are unavailable for this symbol right now."
+    assert r.json()["error"] == "Signals are unavailable for this symbol right now."
 
 
 def test_unexpected_exception_is_opaque_with_reference(client, stub):
@@ -54,7 +54,7 @@ def test_unexpected_exception_is_opaque_with_reference(client, stub):
     assert r.status_code == 500
     text = r.text
     assert "secret" not in text and "internal.example" not in text and "abc123" not in text
-    assert r.json()["error"]["ref"] == r.headers["x-request-id"]
+    assert r.json()["ref"] == r.headers["x-request-id"]
     assert r.headers["x-content-type-options"] == "nosniff"
 
 
