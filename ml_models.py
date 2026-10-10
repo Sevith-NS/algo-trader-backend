@@ -6,6 +6,7 @@ from prophet import Prophet
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import logging
+import urllib.parse
 
 import data_source
 
@@ -82,7 +83,11 @@ def get_ml_insights(symbol):
 
         # 4. Sentiment Analysis (Google News RSS + Vader)
         analyzer = SentimentIntensityAnalyzer()
-        rss_url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&gl=US&ceid=US:en"
+        # Encode the symbol: it arrives straight from the query string, and
+        # unencoded it can inject its own `&` parameters or truncate the URL
+        # at a `#`. news_intel.py already quotes for the same reason.
+        rss_q = urllib.parse.quote(f"{symbol} stock")
+        rss_url = f"https://news.google.com/rss/search?q={rss_q}&hl=en-US&gl=US&ceid=US:en"
         feed = feedparser.parse(rss_url)
         
         scores = []

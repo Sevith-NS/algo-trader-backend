@@ -1,15 +1,22 @@
-flask
-flask-cors
-yfinance
-pandas
-numpy
-scipy
-requests
-xgboost
-scikit-learn
-vaderSentiment
-feedparser
-prophet
-google-generativeai
-python-dotenv
-plotly
+# Pinned to the versions this backend is developed and tested against.
+# Unpinned, a fresh install resolved whatever was newest on PyPI that day,
+# so the environment was neither reproducible nor auditable against a CVE
+# feed. Bump deliberately, then re-run the test_*.py suites.
+#
+# Run with `./run.sh` (or `python app.py`). gunicorn is not listed: it is a
+# deployment concern, not an application dependency.
+flask==3.1.3
+flask-cors==6.0.5
+yfinance==1.6.0
+pandas==3.0.5
+numpy==2.5.2
+scipy==1.18.0
+requests==2.34.2
+xgboost==3.4.1
+scikit-learn==1.9.0
+vaderSentiment==3.3.2
+feedparser==6.0.14
+prophet==1.4.0
+google-genai==2.19.0
+python-dotenv==1.2.3
+plotly==6.9.0

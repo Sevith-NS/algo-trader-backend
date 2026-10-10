@@ -29,13 +29,36 @@ from flask import jsonify, request
 # fresh bucket per request (full limiter bypass) or drain a victim's bucket.
 _TRUST_PROXY = os.environ.get("TRUST_PROXY") == "1"
 
+# Buckets live in this process's memory, so each worker enforces its own full
+# copy of every limit and the real ceiling is (workers x the numbers below).
+# Running `python app.py` means one process and the numbers are exact; put this
+# behind a multi-worker server and every documented limit silently doubles or
+# worse. Divide the budget across workers so the configured limit is the one
+# actually applied.
+#
+# WEB_CONCURRENCY is gunicorn's own name for this, so set it to match whatever
+# --workers you launch with. Capacity floors at 1.0: a bucket that cannot hold
+# a whole token would reject every request.
+_WORKERS = max(1, int(os.environ.get("WEB_CONCURRENCY", "1")))
+
 # scope -> (capacity, refill tokens/sec)
-SCOPES = {
+_BASE_SCOPES = {
     # 120 burst, 60/min sustained: screener page load fires ~6 calls at once
     "standard": (120.0, 1.0),
     # 12 burst, 6/min sustained: each of these fans out to many upstream calls
     "expensive": (12.0, 0.1),
+    # 3 burst, ~1/min sustained: one trading-desk run is ~14 sequential and
+    # parallel LLM turns on top of a full engine sweep, so it gets its own
+    # bucket rather than draining the one the deep-analysis panel shares.
+    "agents": (3.0, 0.017),
+    # 6 burst, ~2/min sustained: a single backtest is cheap once the bars are
+    # cached, but a parameter sweep is hundreds of simulations in one request,
+    # so it does not share the standard bucket.
+    "backtest": (6.0, 0.033),
 }
+
+SCOPES = {name: (max(1.0, capacity / _WORKERS), refill / _WORKERS)
+          for name, (capacity, refill) in _BASE_SCOPES.items()}
 
 _lock = threading.Lock()
 _buckets: dict = {}  # (client, scope) -> {"tokens": float, "ts": float}

@@ -45,9 +45,17 @@ _throttle_lock = threading.Lock()
 _cache_lock = threading.Lock()
 
 # Corporate proxies that MITM TLS (self-signed cert in chain) break verification
-# for ALL outbound HTTPS. On first SSLError we fall back to unverified TLS and
-# remember. Acceptable trade-off here: public market data only, nothing sensitive
-# sent, and the proxy already terminates TLS anyway.
+# for ALL outbound HTTPS. The supported fix is to trust the proxy's CA —
+# run.sh already builds a bundle and exports REQUESTS_CA_BUNDLE for macOS, and
+# any platform can point that variable at the corporate root.
+#
+# Dropping verification is the fallback of last resort and is now opt-in only
+# (ALLOW_INSECURE_TLS=1). It used to trigger automatically on any SSLError
+# whose text mentioned a self-signed certificate, which meant an attacker on
+# the path could cause it: present a self-signed cert once, and this process
+# would stop verifying certificates for every outbound host for the rest of
+# its life — including the news feeds whose text is fed into LLM prompts.
+_ALLOW_INSECURE_TLS = os.environ.get("ALLOW_INSECURE_TLS") == "1"
 _ssl_state = {"verify": True}
 
 
@@ -62,18 +70,15 @@ def http_get(url: str, params: dict | None = None, timeout: int = 15,
     try:
         return requests.get(url, params=params, headers=hdrs, timeout=timeout,
                             verify=_ssl_state["verify"])
-    except requests.exceptions.SSLError as e:
-        # Downgrade ONLY for the corporate-MITM signature (self-signed cert in
-        # chain) or an explicit opt-in — a transient handshake error or captive
-        # portal must not silently disable TLS verification for the process.
-        msg = str(e).lower()
-        mitm = "self signed certificate" in msg or "self-signed certificate" in msg
-        if _ssl_state["verify"] and (mitm or os.environ.get("ALLOW_INSECURE_TLS") == "1"):
+    except requests.exceptions.SSLError:
+        # Only an explicit operator opt-in downgrades verification. Inferring
+        # it from the error text let the error's own author choose.
+        if _ALLOW_INSECURE_TLS and _ssl_state["verify"]:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             _ssl_state["verify"] = False
-            print("[data_source] TLS interception detected (corporate proxy) — "
-                  "continuing without cert verification for public market data.")
+            print("[data_source] ALLOW_INSECURE_TLS=1 — certificate verification "
+                  "disabled for all outbound requests from this process.")
             return requests.get(url, params=params, headers=hdrs, timeout=timeout,
                                 verify=False)
         raise
@@ -247,10 +252,18 @@ def get_json_cached(key: str, url: str, params: dict | None = None,
 
 # ------------------------------------------------------- chart API parsing ---
 
-def _fetch_chart(symbol: str, range_: str = "1y", interval: str = "1d"):
-    """Returns (records, meta) from Yahoo's public v8 chart API."""
-    data = _get_json(_CHART_URL.format(symbol=symbol),
-                     {"range": range_, "interval": interval})
+def _fetch_chart(symbol: str, range_: str = "1y", interval: str = "1d",
+                 period1: int | None = None):
+    """Returns (records, meta) from Yahoo's public v8 chart API.
+
+    `period1` (a unix timestamp) asks for an explicit window instead of a range
+    string. That is the only way to get a real full history — see get_ohlc_max.
+    """
+    params = ({"period1": int(period1), "period2": int(time.time()),
+               "interval": interval}
+              if period1 is not None else
+              {"range": range_, "interval": interval})
+    data = _get_json(_CHART_URL.format(symbol=symbol), params)
     result = data["chart"]["result"][0]
     meta = result.get("meta", {})
     timestamps = result.get("timestamp") or []
@@ -372,6 +385,47 @@ def get_ohlc(symbol: str, range_: str = "1y", interval: str = "1d") -> list:
             return cached
         try:
             records, _meta = _fetch_chart(symbol, range_=range_, interval=interval)
+            if records:
+                _cache_put(key, records)
+                return records
+        except Exception:
+            pass
+        return cached if cached is not None else []
+
+
+# Intervals that have a full history worth asking for. Intraday is capped by
+# MAX_RANGE_FOR_INTERVAL no matter how the request is phrased.
+FULL_HISTORY_INTERVALS = ("1d", "1wk", "1mo")
+
+
+def get_ohlc_max(symbol: str, interval: str = "1d") -> list:
+    """Every bar Yahoo holds for a daily-or-slower interval.
+
+    `range=max` with `interval=1d` does not mean what it looks like: Yahoo
+    quietly coarsens the result rather than returning tens of thousands of
+    candles — AAPL comes back as ~170 quarterly bars, not 10,000 daily ones,
+    which silently turns a decades-long backtest into a 169-point one. Asking
+    with an explicit period1/period2 window instead returns the real series.
+
+    Ranges of 10y and under are unaffected, so get_ohlc stays the right call
+    for everything else.
+    """
+    if interval not in FULL_HISTORY_INTERVALS:
+        return get_ohlc(symbol, range_=MAX_RANGE_FOR_INTERVAL.get(interval, "max"),
+                        interval=interval)
+
+    key = f"ohlcfull:{symbol}:{interval}"
+    cached, fresh = _cache_get(key, FRESH_TTL["history"])
+    if cached is not None and fresh:
+        return cached
+
+    with _singleflight(key):
+        cached, fresh = _cache_get(key, FRESH_TTL["history"])
+        if cached is not None and fresh:
+            return cached
+        try:
+            # 0 is before any listing; Yahoo clamps it to the symbol's own start.
+            records, _meta = _fetch_chart(symbol, interval=interval, period1=0)
             if records:
                 _cache_put(key, records)
                 return records

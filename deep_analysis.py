@@ -35,6 +35,7 @@ import quant_models
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+_MODEL = "gemini-3.6-flash"
 
 
 # ------------------------------------------------------ technical structure ---
@@ -316,17 +317,20 @@ def _narrative(symbol: str, company: str, payload: dict) -> dict | None:
     if not _GEMINI_KEY:
         return None
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=_GEMINI_KEY)
-        model = genai.GenerativeModel(
-            "gemini-2.5-flash",
-            generation_config={"response_mime_type": "application/json"},
-        )
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=_GEMINI_KEY)
         prompt = _NARRATIVE_PROMPT.format(
             symbol=symbol, company=company,
             data=json.dumps(payload, default=str)[:24000],
         )
-        resp = model.generate_content(prompt)
+        resp = client.models.generate_content(
+            model=_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
         return json.loads(resp.text)
     except Exception:
         import traceback

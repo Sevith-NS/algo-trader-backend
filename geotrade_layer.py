@@ -5,15 +5,16 @@ import feedparser
 import traceback
 import urllib.parse
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 # Load environment variables (look in parent directories if needed)
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 # Fallback API key loaded from .env if needed
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+MODEL = "gemini-3.6-flash"
 
 # Using ISO-3 Codes for react-globe.gl compatibility
 TARGET_COUNTRIES = {
@@ -72,8 +73,7 @@ def get_geotrade_analysis():
         ]
         """
         
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt)
+        response = _client.models.generate_content(model=MODEL, contents=prompt)
         
         response_text = response.text.strip()
         if response_text.startswith("```json"):
@@ -124,8 +124,7 @@ def get_deep_country_analysis(country_code):
         Ensure "recommendations" contains at least 3 actionable ETFs or equities (US-listed if possible, or local primary indices) that a retail trader could theoretically buy or short to express this view.
         """
         
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt)
+        response = _client.models.generate_content(model=MODEL, contents=prompt)
         
         response_text = response.text.strip()
         if response_text.startswith("```json"):

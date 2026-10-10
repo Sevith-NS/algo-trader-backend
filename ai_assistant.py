@@ -10,15 +10,17 @@ import os
 import json
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 import quant_models
 import news_engine
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+MODEL = "gemini-3.6-flash"
 
 SYSTEM_PROMPT = """You are Flint AI, the in-app assistant of a personal portfolio
 management and stock screening platform. You help the user understand their
@@ -72,13 +74,19 @@ def chat(messages: list, portfolio: dict | None = None, symbol: str | None = Non
         history = []
         for m in messages[:-1]:
             role = "model" if m.get("role") == "assistant" else "user"
-            history.append({"role": role, "parts": [m.get("content", "")]})
+            history.append(types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=m.get("content", ""))],
+            ))
 
         last_user = messages[-1].get("content", "") if messages else ""
         prompt = f"CONTEXT (live data, cite from here):\n{context}\n\nUSER QUESTION:\n{last_user}"
 
-        model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=SYSTEM_PROMPT)
-        session = model.start_chat(history=history)
+        session = _client.chats.create(
+            model=MODEL,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            history=history,
+        )
         response = session.send_message(prompt)
 
         return {"reply": response.text}

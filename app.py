@@ -1,4 +1,6 @@
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify, stream_with_context
+import json
+import os
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
@@ -17,16 +19,56 @@ import screener_engine
 import levels_engine
 import nse_segments
 import movers_engine
+import agents_desk
+import llm_router
+from backtest import service as backtest_service
+from backtest.errors import BacktestError
 from rate_limiter import rate_limit
 
 app = Flask(__name__)
-# Allow CORS for Next.js frontend running on port 3000.
+
+# Allow CORS for the Next.js frontend. Origins are an explicit allowlist from
+# CORS_ORIGINS (comma-separated) so a deployment names its own frontend without
+# a code change; the default covers local dev on either loopback spelling.
+#
+# This was previously "*". These routes carry no auth, so a wildcard let any
+# page a user visited drive the whole API from their browser — spending Gemini
+# quota and, because the limiter buckets by client IP, drawing on a different
+# bucket per victim rather than the attacker's own.
+_DEFAULT_CORS_ORIGINS = 'http://localhost:3000,http://127.0.0.1:3000'
+CORS_ORIGINS = [o.strip() for o in
+                os.environ.get('CORS_ORIGINS', _DEFAULT_CORS_ORIGINS).split(',')
+                if o.strip()]
+
 # expose_headers: Retry-After / X-RateLimit-* are not CORS-safelisted, so
 # without this the browser hides them from fetch() and the client can't
 # show an accurate rate-limit countdown.
-CORS(app, resources={r"/api/*": {"origins": "*"}},
+CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}},
      expose_headers=['Retry-After', 'X-RateLimit-Limit',
                      'X-RateLimit-Remaining', 'X-RateLimit-Reset'])
+
+# Cap request bodies. The POST routes take JSON of bounded shape (a position
+# list, a chat history, a backtest spec), so a megabyte is already generous;
+# without a cap a single request can grow the worker's memory without limit.
+app.config['MAX_CONTENT_LENGTH'] = int(
+    os.environ.get('MAX_CONTENT_LENGTH_BYTES', 1 * 1024 * 1024))
+
+# A 500 means an unexpected internal failure. The exception text routinely
+# carries upstream URLs, local file paths and library internals, so it goes to
+# the log and the client gets a fixed string. The deliberate 4xx/503 messages
+# raised by the engines' own exception types are safe to show and keep theirs.
+_INTERNAL_ERROR = 'Internal error — the request could not be completed.'
+
+
+def _server_error(exc):
+    """Log the real cause, return an opaque 500 body."""
+    app.logger.exception('unhandled error on %s', request.path)
+    return jsonify({'error': _INTERNAL_ERROR}), 500
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    return jsonify({'error': 'Request body too large.'}), 413
 
 # Client-side caching policy per resource class (system-design: cache close
 # to the consumer; the browser absorbs repeat GETs before they hit us).
@@ -48,6 +90,7 @@ _CACHE_POLICY = {
     # and the route drops to no-store entirely while the board is partial.
     '/api/movers': 'public, max-age=60',
     '/api/movers/scopes': 'public, max-age=3600',
+    '/api/backtest/strategies': 'public, max-age=3600',
 }
 
 @app.after_request
@@ -59,6 +102,28 @@ def add_cache_headers(response):
         # those would keep showing the outage after the backend recovers.
         if policy and not (response.is_json and b'"error"' in response.get_data()[:120]):
             response.headers.setdefault('Cache-Control', policy)
+    return response
+
+
+@app.after_request
+def add_security_headers(response):
+    """Baseline hardening headers.
+
+    This process answers with JSON and SSE only — it serves no HTML, script or
+    frame — so the CSP can deny everything outright rather than enumerate
+    sources. nosniff matters most here: it stops a browser treating a JSON
+    body that happens to contain markup as HTML.
+
+    No HSTS: this binds plain http:// locally, where browsers ignore the header
+    anyway. If this ever sits behind a TLS-terminating proxy, that proxy is the
+    only place that knows the real scheme and should own the policy for the
+    whole domain.
+    """
+    response.headers.setdefault('Content-Security-Policy',
+                                "default-src 'none'; frame-ancestors 'none'")
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
     return response
 
 @app.route('/api/search', methods=['GET'])
@@ -74,7 +139,7 @@ def search():
         data = response.json()
         return jsonify(data)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/quote', methods=['GET'])
 @rate_limit('standard')
@@ -86,7 +151,7 @@ def quote():
     try:
         return jsonify(data_source.get_quote(symbol))
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/chart', methods=['GET'])
 @rate_limit('standard')
@@ -145,7 +210,7 @@ def chart():
             'quotes': quotes,
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/trending', methods=['GET'])
 @rate_limit('standard')
@@ -153,7 +218,7 @@ def trending():
     try:
         return jsonify(data_source.get_trending())
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/ml-insights', methods=['GET'])
 @rate_limit('standard')
@@ -284,9 +349,7 @@ def market_overview():
     try:
         return jsonify(data_source.get_market_overview())
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 def _scan_response(result):
     """jsonify a scan payload; an outage scan (parsed == 0) must not be
@@ -311,7 +374,7 @@ def discover():
     except screener_engine.UnknownUniverseError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/screens', methods=['GET'])
 @rate_limit('standard')
@@ -321,7 +384,7 @@ def screens_catalogue():
     try:
         return jsonify(screener_engine.list_screens())
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/screens/run', methods=['GET'])
 @rate_limit('standard')
@@ -339,7 +402,7 @@ def screens_run():
     except screener_engine.UnknownUniverseError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/levels', methods=['GET'])
 @rate_limit('standard')
@@ -363,9 +426,7 @@ def levels():
     except screener_engine.UnknownUniverseError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/movers/scopes', methods=['GET'])
@@ -378,7 +439,7 @@ def movers_scopes():
     except nse_segments.SegmentsUnavailableError as e:
         return jsonify({'error': str(e)}), 503
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/movers', methods=['GET'])
@@ -412,9 +473,7 @@ def movers():
     except nse_segments.SegmentsUnavailableError as e:
         return jsonify({'error': str(e)}), 503
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
     resp = jsonify(result)
     if result['partial'] or result['priced'] == 0:
@@ -462,7 +521,7 @@ def geotrade():
         data = geotrade_layer.get_geotrade_analysis()
         return jsonify(data)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/geotrade/deep', methods=['GET'])
 @rate_limit('expensive')
@@ -475,7 +534,187 @@ def geotrade_deep():
         data = geotrade_layer.get_deep_country_analysis(country)
         return jsonify(data)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
+
+# ------------------------------------------------------------ trading desk ---
+# Multi-agent decision pipeline (see agents_desk.py): four analysts, a bull/bear
+# debate, a trader, a three-seat risk committee and a portfolio manager, with a
+# journal of past decisions scored on realized alpha feeding the next run.
+
+@app.route('/api/agents/run', methods=['POST'])
+@rate_limit('agents')
+def agents_run():
+    """Stream a full desk run as Server-Sent Events.
+
+    POST rather than GET (so the paper portfolio travels in the body, not a
+    query string), which is why the client reads the stream with fetch() rather
+    than EventSource. Pass {"stream": false} to get one collected JSON payload
+    instead — the run still takes the same ~40s, it just arrives at the end.
+    """
+    data = request.json or {}
+    symbol = (data.get('symbol') or '').strip()
+    if not symbol:
+        return jsonify({'error': 'JSON body must contain a "symbol"'}), 400
+
+    try:
+        rounds = int(data.get('rounds', agents_desk.DEFAULT_ROUNDS))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Body field "rounds" must be an integer'}), 400
+    if not 1 <= rounds <= agents_desk.MAX_ROUNDS:
+        return jsonify({
+            'error': f'"rounds" must be between 1 and {agents_desk.MAX_ROUNDS}'}), 400
+
+    portfolio = data.get('portfolio') if isinstance(data.get('portfolio'), dict) else None
+
+    if data.get('stream') is False:
+        return jsonify(agents_desk.run_desk_sync(symbol, portfolio=portfolio, rounds=rounds))
+
+    def generate():
+        # Every event is emitted inside run_desk's own try/except, so a failure
+        # arrives as an {"type": "error"} frame rather than a truncated stream.
+        for event in agents_desk.run_desk(symbol, portfolio=portfolio, rounds=rounds):
+            yield f"data: {json.dumps(event, default=str)}\n\n"
+
+    resp = Response(stream_with_context(generate()), mimetype='text/event-stream')
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['Connection'] = 'keep-alive'
+    # Proxies that buffer would defeat the point of streaming the debate.
+    resp.headers['X-Accel-Buffering'] = 'no'
+    return resp
+
+
+@app.route('/api/agents/routing', methods=['GET'])
+@rate_limit('standard')
+def agents_routing():
+    """Where desk calls are currently going: Gemini, or the OmniRoute fallback.
+
+    Reports whether the gateway is reachable and how long Gemini is benched for,
+    so an operator can tell "quota exhausted, rerouted" apart from "quota
+    exhausted, no fallback installed".
+    """
+    return jsonify(llm_router.status())
+
+
+@app.route('/api/agents/journal', methods=['GET'])
+@rate_limit('standard')
+def agents_journal():
+    """Past desk decisions, scored against realized return and alpha vs the S&P.
+
+    Scoring runs off data_source's cached closes, so this is cheap to refresh.
+    """
+    symbol = request.args.get('symbol')
+    try:
+        limit = int(request.args.get('limit', 60))
+    except ValueError:
+        return jsonify({'error': 'Query parameter "limit" must be an integer'}), 400
+
+    try:
+        return jsonify(agents_desk.get_journal(symbol, limit=max(1, min(limit, 200))))
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route('/api/agents/journal/<entry_id>', methods=['DELETE'])
+@rate_limit('standard')
+def agents_journal_delete(entry_id):
+    """Drop one decision from the journal so it stops informing future runs."""
+    if agents_desk.journal_delete(entry_id):
+        return jsonify({'deleted': entry_id})
+    return jsonify({'error': 'No journal entry with that id.'}), 404
+
+
+# ------------------------------------------------------------- backtesting ---
+# Event-driven backtester (see backtest/): signals formed at a bar's close and
+# filled at the next open, costs charged on both sides, stops checked intrabar
+# against the real high and low. The engines are the desktop tester's, so a run
+# here and a run there agree bar for bar on the same frame.
+
+@app.route('/api/backtest/strategies', methods=['GET'])
+@rate_limit('standard')
+def backtest_strategies():
+    """The strategy catalogue: names, one-line descriptions and every parameter."""
+    return jsonify({'strategies': backtest_service.list_strategies()})
+
+
+@app.route('/api/backtest/run', methods=['POST'])
+@rate_limit('backtest')
+def backtest_run():
+    """One backtest, plus whichever robustness passes were requested.
+
+    POST rather than GET: the body carries a strategy parameter map, a date
+    window and the cost model, which do not belong in a query string.
+
+    Synchronous — a daily backtest over four decades of bars is a couple of
+    seconds once the history is cached. The sweeps below are the ones that
+    stream, because they are hundreds of these.
+    """
+    req = request.json or {}
+    try:
+        return jsonify(backtest_service.run(req))
+    except BacktestError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return _server_error(e)
+
+
+def _stream_backtest(generator_fn, req):
+    """Run one of the sweep generators as Server-Sent Events.
+
+    The first event is produced inside this handler rather than in the stream,
+    so a bad grid or an unknown symbol still comes back as a 400 with a real
+    message instead of a 200 whose first frame happens to be an error.
+    """
+    try:
+        stream = generator_fn(req)
+        first = next(stream)
+    except BacktestError as e:
+        return jsonify({'error': str(e)}), 400
+    except StopIteration:
+        return jsonify({'error': 'The sweep produced no work to do.'}), 400
+    except Exception as e:
+        return _server_error(e)
+
+    def generate():
+        yield f"data: {json.dumps(first, default=str)}\n\n"
+        try:
+            for event in stream:
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+        except BacktestError as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        except Exception:
+            app.logger.exception('unhandled error streaming %s', request.path)
+            yield f"data: {json.dumps({'type': 'error', 'message': _INTERNAL_ERROR})}\n\n"
+
+    resp = Response(stream_with_context(generate()), mimetype='text/event-stream')
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['Connection'] = 'keep-alive'
+    # Proxies that buffer would defeat the point of streaming the progress.
+    resp.headers['X-Accel-Buffering'] = 'no'
+    return resp
+
+
+@app.route('/api/backtest/optimize', methods=['POST'])
+@rate_limit('backtest')
+def backtest_optimize():
+    """Parameter sweep, streamed. Ranked by Sharpe, with a note on whether the
+    winner sits on a plateau or is a lone spike in the noise."""
+    return _stream_backtest(backtest_service.optimize, request.json or {})
+
+
+@app.route('/api/backtest/walk-forward', methods=['POST'])
+@rate_limit('backtest')
+def backtest_walk_forward():
+    """Rolling optimise-then-trade folds, streamed one fold at a time.
+
+    The expensive one: the whole grid runs once per fold. It is also the only
+    result here that was never fitted on the bars it reports.
+    """
+    return _stream_backtest(backtest_service.walk_forward, request.json or {})
+
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # debug must be opted into explicitly: Flask's debug mode serves the
+    # Werkzeug console, which executes arbitrary Python from anyone who can
+    # reach it. run.sh launches this path, so defaulting it on exposed the
+    # console on every local run. Set FLASK_DEBUG=1 when you want it.
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', port=5000)
