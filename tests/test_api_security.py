@@ -84,3 +84,15 @@ def test_feed_links_keep_only_http():
     assert data_source.web_link(" http://example.com ") == "http://example.com"
     for bad in ("javascript:alert(1)", "JaVaScRiPt:x", "data:text/html,x", "//evil.com", "", None, 42):
         assert data_source.web_link(bad) is None
+
+
+def test_previous_close_matches_by_session_date():
+    import data_source
+    # NYSE, gmtoffset -4h. Candles open 13:30 UTC; the quote time is that day's close.
+    rec = [{"t": "2026-10-08T13:30:00+00:00", "c": 340.42},
+           {"t": "2026-10-09T13:30:00+00:00", "c": 336.6400146484375}]
+    meta = {"regularMarketTime": 1791576000, "gmtoffset": -14400}   # 2026-10-09 16:00 EDT
+    # Float32 candle close vs a rounded price must still count as the same session.
+    assert data_source._previous_close(rec, meta, 336.64) == 340.42
+    # Quote from a later session whose candle hasn't arrived: the last candle is the previous close.
+    assert data_source._previous_close(rec, {**meta, "regularMarketTime": 1791576000 + 3 * 86400}, 338.0) == 336.6400146484375

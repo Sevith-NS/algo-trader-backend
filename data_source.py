@@ -22,6 +22,7 @@ import time
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -539,6 +540,28 @@ def get_quote(symbol: str) -> dict:
         return _fetch_quote(key, symbol, cached)
 
 
+def _previous_close(records: list[dict], meta: dict, price):
+    """Close of the session before the quote's session.
+
+    Matched by date in the exchange's own time zone: if the last candle is the
+    quote's session, the one before it is the previous close. Comparing prices
+    instead fails on float32 candles (336.6400146 vs 336.64), which made a
+    finished session look unchanged.
+    """
+    closes = [r["c"] for r in records]
+    if len(closes) >= 2 and meta.get("regularMarketTime"):
+        offset = meta.get("gmtoffset") or 0
+        session = time.gmtime(meta["regularMarketTime"] + offset)[:3]
+        try:
+            last = datetime.fromisoformat(records[-1]["t"]).timestamp()
+            return closes[-2] if time.gmtime(last + offset)[:3] == session else closes[-1]
+        except (KeyError, TypeError, ValueError):
+            pass
+    if len(closes) >= 2 and price:
+        return closes[-2] if abs(closes[-1] - price) <= 1e-6 * abs(price) else closes[-1]
+    return meta.get("previousClose") or meta.get("chartPreviousClose")
+
+
 def _fetch_quote(key: str, symbol: str, cached):
     """Uncached quote fetch — call only while holding the key's flight lock."""
     quote = None
@@ -548,11 +571,7 @@ def _fetch_quote(key: str, symbol: str, cached):
         closes = [r["c"] for r in records]
         if price is None and closes:
             price = closes[-1]
-        # previous session close: last candle before today's
-        prev = None
-        if len(closes) >= 2:
-            prev = closes[-2] if abs(closes[-1] - (price or 0)) < 1e-9 else closes[-1]
-        prev = meta.get("previousClose") or prev or meta.get("chartPreviousClose")
+        prev = _previous_close(records, meta, price)
         quote = {
             "symbol": symbol,
             "shortName": meta.get("shortName") or symbol,
