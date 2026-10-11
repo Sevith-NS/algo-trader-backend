@@ -61,6 +61,19 @@ _ALLOW_INSECURE_TLS = os.environ.get("ALLOW_INSECURE_TLS") == "1"
 _ssl_state = {"verify": True}
 
 
+def web_link(url) -> str | None:
+    """A third-party link, kept only if it is plain http(s).
+
+    Feed entries are attacker-controllable text; a `javascript:` or `data:`
+    link rendered as an <a href> would run in the user's session. Anything
+    else becomes None, which the UI shows as unlinked text.
+    """
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    return url if url.lower().startswith(("https://", "http://")) and len(url) <= 2048 else None
+
+
 def http_get(url: str, params: dict | None = None, timeout: int = 15,
              headers: dict | None = None):
     """requests.get with browser UA + automatic corporate-MITM fallback.

@@ -76,3 +76,11 @@ def test_unknown_route_is_json_404(client):
 def test_oversized_body_is_413(client):
     r = client.post("/api/session", content=b"x" * (1024 * 1024 + 1), headers=auth())
     assert r.status_code == 413
+
+
+def test_feed_links_keep_only_http():
+    import data_source
+    assert data_source.web_link("https://example.com/a") == "https://example.com/a"
+    assert data_source.web_link(" http://example.com ") == "http://example.com"
+    for bad in ("javascript:alert(1)", "JaVaScRiPt:x", "data:text/html,x", "//evil.com", "", None, 42):
+        assert data_source.web_link(bad) is None

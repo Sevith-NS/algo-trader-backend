@@ -85,7 +85,7 @@ def _fetch_feed(url: str, source_tag: str, max_items: int = 15) -> list:
             outlet = entry.source.title
         items.append({
             "title": title,
-            "link": entry.get("link"),
+            "link": data_source.web_link(entry.get("link")),
             "source": outlet or source_tag,
             "feed": source_tag,
             "published_dt": published,
