@@ -584,6 +584,7 @@ def _fetch_quote(key: str, symbol: str, cached):
             "fiftyTwoWeekHigh": meta.get("fiftyTwoWeekHigh"),
             "fiftyTwoWeekLow": meta.get("fiftyTwoWeekLow"),
             "marketCap": None,
+            "regularMarketTime": meta.get("regularMarketTime"),
         }
         # enrich from cached yearly history if available (no extra network call)
         hist_cached, _ = _cache_get(f"hist:{symbol}:1y", STALE_TTL)

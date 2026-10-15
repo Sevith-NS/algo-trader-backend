@@ -90,6 +90,14 @@ def export(user: Principal = Depends(limit("expensive"))):
             "watchlists": conn.execute("select * from watchlists order by created_at").fetchall(),
             "watchlist_items": conn.execute("select * from watchlist_items order by added_at").fetchall(),
             "journal_entries": conn.execute("select * from journal_entries order by created_at").fetchall(),
+            # Never the access token, even encrypted: it is a credential, not the user's data.
+            "broker_connections": conn.execute(
+                "select id, broker, broker_user_id, broker_user_name, status, token_expires_at, last_synced_at, "
+                "last_error, created_at from broker_connections order by created_at").fetchall(),
+            "holdings": conn.execute("select * from holdings order by account_id, symbol").fetchall(),
+            "account_snapshots": conn.execute("select * from account_snapshots order by account_id, on_date").fetchall(),
+            "alerts": conn.execute("select * from alerts order by created_at").fetchall(),
+            "alert_firings": conn.execute("select * from alert_firings order by fired_at").fetchall(),
         }
     import json
     body = json.loads(json.dumps(data, default=str))

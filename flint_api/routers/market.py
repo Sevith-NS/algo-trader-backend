@@ -1,19 +1,23 @@
-"""Market-wide data: search, quotes, charts, overview, discovery, movers."""
+"""Market-wide data: search, quotes, charts, overview, pulse, FX, discovery, movers."""
 from typing import Annotated, Literal
+
+from datetime import datetime, timezone
 
 import pandas as pd
 from fastapi import APIRouter, Depends, Query, Response
+from pydantic import StringConstraints
 
 import data_source
 import levels_engine
 import movers_engine
 import nse_segments
+import pulse_engine
 import screener_engine
 
 from ..errors import AppError, NotFound, Unavailable
 from ..ratelimit import limit
 from ..validators import RegistryId, Symbol
-from ._common import cache
+from ._common import cache, unwrap
 
 router = APIRouter(tags=["market"])
 standard = Depends(limit("standard"))
@@ -140,3 +144,32 @@ def movers(response: Response, scope: RegistryId = "allnse",
     else:
         cache(response, 60)
     return result
+
+
+@router.get("/markets/pulse", dependencies=[standard])
+def market_pulse(response: Response, market: Literal["in", "us"] = "in"):
+    """Headline indices, breadth and sectors for one market."""
+    result = unwrap(pulse_engine.get_pulse(market))
+    cache(response, 60)
+    return result
+
+
+FxPair = Annotated[str, StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"^[A-Za-z]{6}$")]
+
+
+@router.get("/fx", dependencies=[standard])
+def fx(response: Response, pair: FxPair):
+    """One FX rate with its source and time, e.g. pair=USDINR (INR per USD)."""
+    base, quote = pair[:3], pair[3:]
+    if base == quote:
+        raise AppError("Pick two different currencies.")
+    q = unwrap(data_source.get_quote(f"{pair}=X"))
+    rate = q.get("regularMarketPrice")
+    if not isinstance(rate, (int, float)) or rate <= 0:
+        raise Unavailable("That exchange rate is unavailable right now.")
+    ts = q.get("regularMarketTime")
+    cache(response, 60)
+    return {"pair": pair, "base": base, "quote": quote, "rate": rate,
+            "source": "Yahoo Finance (delayed)",
+            "as_of": datetime.fromtimestamp(ts, timezone.utc).isoformat() if isinstance(ts, (int, float)) else None,
+            "stale": bool(q.get("stale"))}
