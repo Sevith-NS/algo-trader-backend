@@ -1,10 +1,11 @@
 """Market pulse for India and the US: headline indices, breadth and sectors.
 
 Indices and sectors come from one batched Yahoo spark request per market
-(cached 5 minutes, stale-if-error), using each node's full-day change against
-the previous close. Breadth is honest about its universe:
-  - India: advancers/decliners across NIFTY 500, from the movers scan, with
-    its coverage (a partial scan says so).
+(cached 5 minutes, stale-if-error); the day's change is close-to-close by
+calendar day, as /api/quote computes it. Breadth is honest about its universe:
+  - India: advancers/decliners across NIFTY 500, from the movers scan, once it
+    has priced at least half the index (a partial scan says so). Until then,
+    the NSE sector indices, labelled as such.
   - US: there is no constituent scan, so breadth counts the 11 S&P 500 sector
     ETFs advancing vs declining, and is labelled that way.
 Session state uses regular exchange hours on weekdays; exchange holidays are
@@ -17,6 +18,7 @@ import movers_engine
 import nse_segments
 
 _TTL = 5 * 60
+MIN_SCAN_COVERAGE_PCT = 50.0
 
 MARKETS = {
     "in": {
@@ -76,13 +78,17 @@ def _quotes(pairs: list[tuple[str, str]]) -> tuple[list[dict], list[str]]:
     rows, missing = [], []
     for symbol, name in pairs:
         node = payload.get(symbol) or {}
-        price, change, pct = node.get("fulldayPrice"), node.get("fulldayChange"), node.get("fulldayChangePercent")
         series = movers_engine._series_from_node(node) if node else None
-        if price is None and series is not None:
-            price = float(series.iloc[-1])
-        if pct is None and series is not None:
-            prev = float(series.iloc[-2])
+        if series is not None:
+            # Close-to-close by calendar day, as the quote endpoint computes it.
+            # Yahoo's spark "fullday" fields disagree with it for ETFs
+            # (XLK -1.62% vs -2.98% on 14 Oct 2026), so they are only a fallback.
+            price, prev = float(series.iloc[-1]), float(series.iloc[-2])
             change, pct = price - prev, (price / prev - 1) * 100 if prev else None
+        else:
+            # Some NSE sector indices come back with a single print; for indices
+            # the fullday fields matched the closes when both were available.
+            price, change, pct = node.get("fulldayPrice"), node.get("fulldayChange"), node.get("fulldayChangePercent")
         if price is None or pct is None:
             missing.append(symbol)
             continue
@@ -100,7 +106,9 @@ def _breadth_in() -> dict | None:
         m = movers_engine.get_movers("nifty500", limit=1)
     except (nse_segments.SegmentsUnavailableError, nse_segments.UnknownScopeError):
         return None
-    if not m.get("priced"):
+    # A cold scan prices a handful of stocks first; "2 up, 1 down" from 3 of
+    # 500 is not market breadth. Below half coverage, use the sector indices.
+    if not m.get("priced") or m.get("coverage_pct", 0) < MIN_SCAN_COVERAGE_PCT:
         return None
     return {"universe": "NIFTY 500 stocks", **m["breadth"], "priced": m["priced"], "scanned": m["scanned"],
             "coverage_pct": m["coverage_pct"], "partial": m["partial"], "as_of": m["as_of"]}

@@ -181,6 +181,37 @@ def test_pulse_us(monkeypatch):
     assert p["missing"] == []
 
 
+def test_pulse_prefers_closes_over_spark_fullday(monkeypatch):
+    # The XLK case from 14 Oct 2026: spark said -1.62% while the closes (and
+    # /api/quote) said -2.98%. Two daily closes must win over the fullday field.
+    import data_source
+    import pulse_engine
+    nodes = {"XLK": {"symbol": "XLK", "fulldayPrice": 190.43, "fulldayChange": -3.14, "fulldayChangePercent": -1.623,
+                     "timestamp": [1791921600, 1792008000], "close": [196.28, 190.43]},
+             "XLV": {"symbol": "XLV", "fulldayPrice": 100.0, "fulldayChange": 1.0, "fulldayChangePercent": 1.0,
+                     "timestamp": [1792008000], "close": [100.0]}}
+    monkeypatch.setattr(data_source, "get_json_cached", lambda key, url, params, fresh_ttl: nodes)
+    rows, missing = pulse_engine._quotes([("XLK", "Technology"), ("XLV", "Health care")])
+    by = {r["symbol"]: r for r in rows}
+    assert by["XLK"]["change_pct"] == -2.98 and by["XLK"]["price"] == 190.43
+    assert by["XLV"]["change_pct"] == 1.0  # one close only: the fullday field is the fallback
+    assert missing == []
+
+
+@pytest.mark.parametrize("coverage,universe", [(0.6, "NSE sector indices"), (96.0, "NIFTY 500 stocks")])
+def test_india_breadth_needs_half_the_index(monkeypatch, coverage, universe):
+    import data_source
+    import movers_engine
+    import pulse_engine
+    monkeypatch.setattr(data_source, "get_json_cached",
+                        lambda key, url, params, fresh_ttl: _spark(params["symbols"].split(",")))
+    priced = round(500 * coverage / 100)
+    monkeypatch.setattr(movers_engine, "get_movers", lambda scope, limit: {
+        "priced": priced, "scanned": 500, "coverage_pct": coverage, "partial": coverage < 100, "as_of": "2026-10-15",
+        "breadth": {"advancing": priced - 1, "declining": 1, "unchanged": 0}})
+    assert pulse_engine.get_pulse("in")["breadth"]["universe"] == universe
+
+
 def test_pulse_reports_missing_and_total_outage(monkeypatch):
     import data_source
     import pulse_engine
