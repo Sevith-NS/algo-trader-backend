@@ -1,0 +1,25 @@
+# Never upload credentials. .env.example is excluded too while it holds real values.
+.env*
+
+# Local environments and tooling
+venv/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+graphify-out/
+.obsidian/
+.claude/
+
+# Caches rebuilt at runtime (Vercel's filesystem is read-only outside /tmp)
+.market_cache.json
+.nse_segments.json
+.groww_instruments.json
+.agent_journal.json
+.ca-bundle.pem
+
+# Tests and migrations run locally, not on Vercel
+tests/
+test_*.py
+db/
