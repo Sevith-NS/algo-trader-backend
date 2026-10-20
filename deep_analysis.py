@@ -1,5 +1,5 @@
 """
-Analyst-grade deep teardown: technical structure + composite verdict + AI narrative.
+Deep dive: technical structure + side-by-side readings + AI narrative. No calls.
 
 Three layers, each honest about what it is:
 
@@ -8,12 +8,11 @@ Three layers, each honest about what it is:
      52-week position and volume behaviour; support & resistance from swing
      levels; OBV-vs-price divergence as the volume-confirmation check.
 
-  2. VERDICT (deterministic) — blends the fundamentals health score, valuation
-     premium vs own history, quant composite and news stance into TWO separate
-     calls, because they are different questions:
-       - short_term: technicals 50% + news 30% + quant momentum 20%
-       - long_term:  fundamentals 55% + valuation 30% + technicals 10% + news 5%
-     Plus a conviction /10 and "price at which this gets interesting".
+  2. READINGS (deterministic) — the fundamentals health score, valuation
+     premium vs own history, technical phase, quant composite and news stance,
+     each normalised to [-1, 1] and shown side by side. No blended call, no
+     conviction and no "buy below" price: Polaris reports, the user decides
+     (SEBI RA rules).
 
   3. NARRATIVE (Gemini, optional) — the full 11-section deep-dive note. Every
      FIGURE must come from the numbers computed above (plus a best-effort
@@ -146,8 +145,8 @@ def _phase_score(phase: str) -> float:
             "distribution": -0.4, "markdown": -0.8}.get(phase, 0.0)
 
 
-def _build_verdict(fund: dict, tech: dict, quant: dict, news: dict) -> dict:
-    """Two verdicts, two time horizons — deliberately separate questions."""
+def _build_readings(fund: dict, tech: dict, quant: dict, news: dict) -> dict:
+    """Each pillar normalised to [-1, 1]. Readings only, never a call."""
     has_fund = "error" not in fund
     has_tech = "error" not in tech
     has_quant = "error" not in quant
@@ -163,47 +162,21 @@ def _build_verdict(fund: dict, tech: dict, quant: dict, news: dict) -> dict:
     q_score = _clamp(quant.get("composite_score", 0) / 0.6) if has_quant else 0.0
     n_score = _clamp(news.get("weighted_score", 0) / 0.4)
 
-    long_score = 0.55 * f_score + 0.30 * v_score + 0.10 * t_score + 0.05 * n_score
-    short_score = 0.50 * t_score + 0.30 * n_score + 0.20 * q_score
-
-    def call(score, buy_thr=0.25, avoid_thr=-0.15):
-        label = "BUY" if score >= buy_thr else "AVOID" if score <= avoid_thr else "HOLD"
-        conviction = round(min(10, abs(score) / 0.7 * 10), 1)
-        return {"call": label, "score": round(score, 3), "conviction_10": conviction}
-
-    long_v, short_v = call(long_score), call(short_score, buy_thr=0.30, avoid_thr=-0.20)
-
-    # Price at which it gets interesting: valuation fair price and/or support
-    interesting = None
-    price = tech.get("price") if has_tech else None
-    fair = fund.get("valuation", {}).get("fair_price_at_hist_pe") if has_fund else None
-    support = tech.get("support", {}).get("near") if has_tech else None
-    candidates = [c for c in (fair, support) if c and price and c < price]
-    if long_v["call"] == "BUY" and price:
-        interesting = price  # already interesting; entry discipline comes from quant levels
-    elif candidates:
-        interesting = round(max(candidates), 2)  # nearest sensible level below
-    elif price:
-        interesting = round(price * 0.9, 2)
-
     return {
-        "long_term": long_v,
-        "short_term": short_v,
         "pillars": {
-            "fundamentals": round(f_score, 3),
-            "valuation": round(v_score, 3),
-            "technicals": round(t_score, 3),
-            "quant": round(q_score, 3),
+            "fundamentals": round(f_score, 3) if has_fund else None,
+            "valuation": round(v_score, 3) if premium is not None else None,
+            "technicals": round(t_score, 3) if has_tech else None,
+            "quant": round(q_score, 3) if has_quant else None,
             "news": round(n_score, 3),
         },
-        "interesting_price": interesting,
     }
 
 
 # --------------------------------------------------------------- narrative ---
 
-_NARRATIVE_PROMPT = """You are a blunt equity research analyst with 20 years across fundamental,
-technical and behavioral finance. Write the full deep-dive teardown for {symbol} ({company}).
+_NARRATIVE_PROMPT = """You explain company and market data in plain English for a self-directed
+investor. Write a full, factual deep dive on {symbol} ({company}).
 
 GROUNDING RULES (non-negotiable):
 - ALL FIGURES must come from the DATA block. Never invent a number. If a figure
@@ -218,12 +191,11 @@ GROUNDING RULES (non-negotiable):
 - Promoter/insider and institutional holding percentages, sector/industry and
   the next earnings date(s) live in DATA.company_profile when present; if
   company_profile is null, those figures are not in the dataset — say so.
-- Be blunt. Don't sugarcoat. If the data does not support the thesis, say so
-  explicitly.
-- final_verdict.call must either agree with the computed deterministic verdict
-  in DATA (verdict.long_term.call) or explicitly state in the rationale why it
-  differs, citing the specific numbers that justify the disagreement.
-- This is a paper-trading research platform; end one_liner without advice framing.
+- Be direct and balanced. If the data is weak or mixed, say so plainly.
+- NEVER recommend an action. Do not say buy, sell, hold, avoid, accumulate,
+  add, trim or exit; do not give a price target, an entry or "attractive below"
+  level, a rating or a conviction. Describe what the data shows and what it
+  depends on; the reader decides. This is a tool, not investment advice.
 
 Respond as JSON with exactly these keys (every value a string unless noted):
 {{
@@ -234,11 +206,11 @@ Respond as JSON with exactly these keys (every value a string unless noted):
   "management_quality": "promoter/insider holding if available, what capital allocation implies, red flags",
   "technical_setup": "price vs 52w high/low and key moving averages, phase",
   "catalysts": "upcoming results dates, known tailwinds/headwinds",
-  "bull_case": "the strongest argument FOR — one string of 3-5 sentences",
-  "bear_case": "what could go wrong, why NOT to buy — one string of 3-5 sentences",
+  "bull_case": "what is going well, per the data — one string of 3-5 sentences",
+  "bear_case": "what could go wrong, per the data — one string of 3-5 sentences",
   "valuation": "P/E, P/B, EV/EBITDA vs own history (and vs peers qualitatively)",
-  "final_verdict": {{"call": "BUY" | "HOLD" | "AVOID", "horizon": "long_term", "rationale": "2-3 sentences"}},
-  "one_liner": "one hard-hitting sentence that summarizes this stock"
+  "what_to_watch": "2-3 measurable things the data says matter next (results, margins, levels already in DATA)",
+  "one_liner": "one plain sentence summarising what the data shows, with no advice"
 }}
 
 DATA:
@@ -339,31 +311,21 @@ def _narrative(symbol: str, company: str, payload: dict) -> dict | None:
         return None
 
 
-# The narrative's final_verdict.call renders as the UI verdict banner, and the
-# DATA block the model reads contains third-party text (headlines, business
-# summary) that can carry prompt injection — whatever the model returns, the
-# call must land inside this closed set, never an attacker-chosen string.
-_VALID_CALLS = {"BUY", "HOLD", "AVOID"}
+# Only these keys reach the UI. The DATA block holds third-party text that can
+# carry prompt injection, so anything else the model adds (a "verdict", a
+# "rating", a "target") is dropped rather than rendered.
+_NARRATIVE_KEYS = ("business_model", "quarterly_results", "balance_sheet", "competitive_position",
+                   "management_quality", "technical_setup", "catalysts", "bull_case", "bear_case",
+                   "valuation", "what_to_watch", "one_liner")
 
 
-def _sanitize_narrative(narrative, verdict: dict):
-    """Clamp final_verdict.call to _VALID_CALLS. Every narrative shape flows
-    through here: non-dict JSON (the model returned a list/string) is dropped,
-    a missing or non-dict final_verdict is rebuilt around the deterministic
-    call, and an off-set call is replaced with verdict.long_term.call while
-    the model's rationale is kept."""
+def _sanitize_narrative(narrative):
+    """Keep the known sections as strings; drop everything else. Non-dict JSON
+    (the model returned a list/string) is dropped, as is a None narrative."""
     if not isinstance(narrative, dict):
-        return None  # also the _narrative()-returned-None path
-    fv = narrative.get("final_verdict")
-    if not isinstance(fv, dict):
-        fv = {}
-        narrative["final_verdict"] = fv
-    call = fv.get("call")
-    call = call.strip().upper() if isinstance(call, str) else None
-    if call not in _VALID_CALLS:
-        call = verdict["long_term"]["call"]
-    fv["call"] = call
-    return narrative
+        return None
+    clean = {k: narrative[k] for k in _NARRATIVE_KEYS if isinstance(narrative.get(k), str)}
+    return clean or None
 
 
 # -------------------------------------------------------------- entry point ---
@@ -374,7 +336,7 @@ def get_deep_analysis(symbol: str, include_ai: bool = False) -> dict:
     quant = quant_models.get_quant_signals(symbol)
     news = news_intel.get_news_intel(symbol, max_total=20)
 
-    verdict = _build_verdict(fund, tech, quant, news)
+    readings = _build_readings(fund, tech, quant, news)
 
     result = {
         "symbol": symbol,
@@ -383,9 +345,9 @@ def get_deep_analysis(symbol: str, include_ai: bool = False) -> dict:
         "news": {k: news[k] for k in (
             "stance", "rating", "confidence", "weighted_score",
             "article_count", "distinct_outlets", "breakdown")},
-        "quant": ({"signal": quant.get("signal"), "composite_score": quant.get("composite_score")}
+        "quant": ({"composite_score": quant.get("composite_score")}
                   if "error" not in quant else None),
-        "verdict": verdict,
+        "readings": readings,
         "narrative": None,
     }
 
@@ -401,12 +363,11 @@ def get_deep_analysis(symbol: str, include_ai: bool = False) -> dict:
                      "top_headlines": [
                          {"title": a["title"], "sentiment": a["sentiment"], "source": a["source"]}
                          for a in news.get("articles", [])[:8]]},
-            "verdict": verdict,
+            "readings": readings,
             # best-effort keyless profile — None whenever Yahoo gates the endpoint
             "company_profile": _company_profile(symbol),
         }
-        result["narrative"] = _sanitize_narrative(
-            _narrative(symbol, company, ai_payload), verdict)
+        result["narrative"] = _sanitize_narrative(_narrative(symbol, company, ai_payload))
 
     return result
 
@@ -424,7 +385,7 @@ def get_holdings_intel(positions: list) -> dict:
             tech = get_technical_structure(sym)
             quant = quant_models.get_quant_signals(sym)
             news = news_intel.get_news_intel(sym, max_total=12)
-            verdict = _build_verdict(fund, tech, quant, news)
+            readings = _build_readings(fund, tech, quant, news)
             top = next((a for a in news.get("articles", [])
                         if a["sentiment"] != "neutral"), None) or \
                   (news.get("articles") or [None])[0]
@@ -445,7 +406,7 @@ def get_holdings_intel(positions: list) -> dict:
                 "top_headline": ({"title": top["title"], "link": top["link"],
                                   "sentiment": top["sentiment"], "source": top["source"]}
                                  if top else None),
-                "verdict": verdict,
+                "readings": readings,
             })
         except Exception:
             logging.getLogger(__name__).exception("holdings intel failed for one symbol")

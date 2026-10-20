@@ -31,19 +31,15 @@ for ev in agents_desk.run_desk("MSFT", portfolio={"balance": 30000, "positions":
         seats += 1; print(f"{el} ANALYST {ev['label']:26s} {ev['score']:+.2f}")
     elif k == "debate":
         seats += 1; print(f"{el} DEBATE  R{ev['round']} {ev['label']:17s} {(ev['argument'] or '')[:60]}")
-    elif k == "judge":
-        seats += 1; print(f"{el} JUDGE   {ev['winner']}/{ev['stance']} conv={ev['conviction_10']}")
-    elif k == "trade_plan":
-        seats += 1; print(f"{el} TRADER  {ev['action']} {ev['horizon_days']}d")
-    elif k == "risk":
-        seats += 1; print(f"{el} RISK    {ev['seat']:13s} {ev['stance']:10s} {ev['size_pct']}%")
-    elif k == "verdict":
-        seats += 1; print(f"{el} PM      {ev['decision']} {ev['action']} {ev['size_pct']}% shares={ev['sizing']['shares']}")
+    elif k == "summary":
+        seats += 1; print(f"{el} SUMMARY {(ev['summary'] or '')[:60]}")
+    elif k == "rules":
+        print(f"{el} RULES   shares={ev['shares']} at risk={ev['risk_amount']} notes={ev['notes']}")
     elif k == "done":
         print(f"{el} DONE    {ev['elapsed_ms']}ms routing={ev['routing']}")
     elif k == "error":
         print(f"{el} ERROR   {ev['message']}")
 
-print(f"\nseats that filed: {seats}/11   seat errors: {errors or 'none'}")
+print(f"\nseats that filed: {seats}/7   seat errors: {errors or 'none'}")
 print(f"failover notice emitted: {bool(notices)}")
 print("counters:", llm_router.counters())

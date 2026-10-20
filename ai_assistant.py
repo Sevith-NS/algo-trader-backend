@@ -28,18 +28,21 @@ _client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 MODEL = "gemini-3.6-flash"
 
-SYSTEM_PROMPT = """You are Flint AI, the in-app assistant of a personal portfolio
-management and stock screening platform. You help the user understand their
-portfolio, markets, risk, and the platform's quant signals.
+SYSTEM_PROMPT = """You are the Polaris assistant, inside a read-only portfolio tracker and
+paper-trading tool. You help the user understand their portfolio, markets, risk,
+and how the platform's quant readings and plan levels are computed.
 
 Rules:
 - Ground every number you cite in the CONTEXT block provided. Never invent prices.
 - Be concise and direct: short paragraphs, bullet lists for multiple points.
-- When discussing a trade, always mention the risk side (stop level, position size).
-- You may explain the platform's quant metrics (z-score, ATR stops, Kelly sizing,
-  VaR, Sharpe) in plain language.
-- Always include a one-line reminder that this is educational analysis on a paper
-  trading platform, not financial advice, when giving trade-related opinions.
+- You explain; you never advise. Do not tell the user to buy, sell, hold, avoid,
+  add, trim or exit anything, and do not give price targets, ratings, convictions
+  or position sizes of your own. If asked "should I buy X?", explain what the data
+  shows on both sides and that the decision is theirs.
+- You may explain the platform's quant metrics (z-score, ATR stops, R multiples,
+  VaR, Sharpe) and how a plan's entry, stop and size were computed, in plain language.
+- Polaris is not a SEBI-registered investment adviser or research analyst. When a
+  question is about a trade, add one line saying this is information, not advice.
 """
 
 
@@ -52,7 +55,11 @@ def _build_context(portfolio: dict, symbol: str | None) -> str:
         try:
             signals = quant_models.get_quant_signals(symbol)
             if "error" not in signals:
-                parts.append(f"QUANT SIGNALS FOR {symbol}:\n" + json.dumps(signals, indent=2))
+                # Readings and levels only: no buy/sell label, conviction or engine size
+                # reaches the model, so it has none to repeat.
+                readings = {k: v for k, v in signals.items()
+                            if k not in ("signal", "action", "conviction", "position_sizing")}
+                parts.append(f"QUANT READINGS FOR {symbol}:\n" + json.dumps(readings, indent=2))
         except Exception:
             pass
         try:

@@ -8,9 +8,9 @@ _JOURNAL_MAX = 500
 
 
 class DbJournalStore:
-    """The desk's decision journal for one user, in Postgres.
+    """The desk's notes for one user, in Postgres.
 
-    Same three methods as agents_desk.FileJournalStore. Each call is its own
+    Same two methods as agents_desk.FileJournalStore. Each call is its own
     short transaction, because the desk streams for ~40s and must not hold a
     connection open while it does.
     """
@@ -40,11 +40,3 @@ class DbJournalStore:
                 "insert into journal_entries (id, user_id, symbol, entry) values (%s, %s, %s, %s::jsonb)",
                 (row_id, self.user_id, entry["symbol"], json.dumps(body, default=str)))
         return entry
-
-    def save_outcomes(self, outcomes: dict) -> None:
-        if not outcomes:
-            return
-        with db.user_tx(self.user_id) as conn:
-            for entry_id, outcome in outcomes.items():
-                conn.execute("update journal_entries set outcome = %s::jsonb where id = %s",
-                             (json.dumps(outcome, default=str), entry_id))

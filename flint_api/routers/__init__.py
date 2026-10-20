@@ -2,7 +2,7 @@
 from fastapi import FastAPI
 
 _MODULES: list[str] = ["market", "symbol", "news", "portfolio", "backtest", "ai",
-                     "me", "ledger", "watchlists", "journal", "brokers", "alerts"]
+                     "me", "ledger", "watchlists", "journal", "brokers", "alerts", "public"]
 
 
 def register(app: FastAPI) -> None:

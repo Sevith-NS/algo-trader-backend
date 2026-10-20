@@ -16,26 +16,34 @@ router = APIRouter(tags=["symbol"])
 standard = Depends(limit("standard"))
 expensive = Depends(limit("expensive"))
 
+# Buy/sell labels, conviction and engine-suggested position sizes never leave
+# the API: Polaris shows readings and the user's own risk-based size, not
+# calls (SEBI RA rules; see docs/API.md). The AI desk still reads them
+# internally until it is rebuilt.
+_CALL_FIELDS = ("signal", "action", "conviction", "position_sizing")
+
 
 @router.get("/quant-signals", dependencies=[standard])
 def quant_signals(response: Response, symbol: Symbol):
     result = unwrap(quant_models.get_quant_signals(symbol))
     cache(response, 300)
-    return result
+    return {k: v for k, v in result.items() if k not in _CALL_FIELDS}
 
 
 @router.get("/ml-insights", dependencies=[standard])
 def ml_insights(response: Response, symbol: Symbol):
     result = unwrap(ml_models.get_ml_insights(symbol))
     cache(response, 600)
-    return result
+    # A 7-day price forecast on a named stock reads as a price target; dropped.
+    return {k: v for k, v in result.items() if k != "prophet_7d_forecast"}
 
 
 @router.get("/advanced-signals", dependencies=[standard])
 def advanced_signals(response: Response, symbol: Symbol):
     result = unwrap(ml_models.get_advanced_signals(symbol))
     cache(response, 600)
-    return result
+    # The stop/take-profit here follow the dropped BUY/SELL label, so they go too.
+    return {k: v for k, v in result.items() if k not in (*_CALL_FIELDS, "stop_loss", "take_profit")}
 
 
 @router.get("/fundamentals", dependencies=[standard])

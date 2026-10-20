@@ -1,5 +1,6 @@
 """Accounts: the paper trading ledger (orders, positions, activity) and the
-read-only real accounts synced from a broker (holdings), plus performance.
+read-only real accounts of the user's broker connections (holdings, live
+from the broker), plus performance.
 
 Rules that protect the record:
 - The server prices every order from a live quote; the client never sends a price.
@@ -8,21 +9,26 @@ Rules that protect the record:
   concurrent sells cannot oversell and two buys cannot overspend.
 - client_order_id makes a double-submitted order land once.
 - Fills are append-only; positions and cash are derived from them.
-- Real accounts never take orders (403 here, and a trigger in the database).
+- Real accounts never take orders: they aren't rows in the database at all,
+  only broker connections held in the user's browser (broker_jar.py).
 """
 import math
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field, StringConstraints
 
 import data_source
 
 from .. import db, performance
+from ..broker_jar import Jar
+from ..brokers import ADAPTERS
 from ..errors import AppError, Forbidden, NotFound, Unavailable
+from .brokers import label as broker_label
+from .brokers import live as live_broker
 from ..ratelimit import limit
 from ..security import Principal
 from ..validators import Symbol
@@ -102,30 +108,22 @@ def _money(value: Decimal) -> str:
 
 # ------------------------------------------------------------------ routes --
 
-def _sync_view(r: dict) -> dict | None:
-    if r["kind"] != "real":
-        return None
-    status = r["sync_status"]
-    if status == "connected" and (not r["has_token"] or (r["token_expires_at"]
-                                                        and r["token_expires_at"] <= datetime.now(timezone.utc))):
-        status = "needs_reconnect"
-    return {"connection_id": str(r["broker_connection_id"]), "status": status,
-            "last_synced_at": r["last_synced_at"]}
-
-
 @router.get("")
-def list_accounts(user: Principal = Depends(limit("standard"))):
+def list_accounts(request: Request, user: Principal = Depends(limit("standard"))):
+    """Paper accounts from the database, then one real account per broker
+    connection in this browser (its id is the connection id)."""
     with db.user_tx(user.user_id) as conn:
-        rows = conn.execute(
-            "select a.id, a.name, a.currency, a.starting_cash, a.created_at, a.kind, a.broker_connection_id, "
-            "c.broker, c.status as sync_status, c.last_synced_at, c.token_expires_at, "
-            "c.access_token_enc is not null as has_token "
-            "from accounts a left join broker_connections c on c.id = a.broker_connection_id "
-            "order by a.kind, a.created_at").fetchall()
-    return {"accounts": [{"id": str(r["id"]), "name": r["name"], "kind": r["kind"], "currency": r["currency"],
-                          "starting_cash": _money(r["starting_cash"]) if r["starting_cash"] is not None else None,
-                          "created_at": r["created_at"], "broker": r["broker"], "sync": _sync_view(r)}
-                         for r in rows]}
+        rows = conn.execute("select id, name, currency, starting_cash, created_at, kind from accounts "
+                            "order by created_at").fetchall()
+    paper = [{"id": str(r["id"]), "name": r["name"], "kind": r["kind"], "currency": r["currency"],
+              "starting_cash": _money(r["starting_cash"]), "created_at": r["created_at"], "broker": None, "sync": None}
+             for r in rows]
+    real = [{"id": c.id, "name": f"{broker_label(c)} {c.broker_user_id}"[:40], "kind": "real",
+             "currency": ADAPTERS[c.broker].CURRENCY,
+             "starting_cash": None, "created_at": c.connected_at, "broker": c.broker,
+             "sync": {"connection_id": c.id, "status": c.status, "last_synced_at": None}}
+            for c in Jar.of(request, user.user_id).connections()]
+    return {"accounts": paper + real}
 
 
 def _paper(account: dict) -> dict:
@@ -240,17 +238,21 @@ def _pct(num: Decimal, den: Decimal) -> str | None:
 
 
 @router.get("/{account_id}/holdings")
-def holdings(account_id: UUID, user: Principal = Depends(limit("standard"))):
-    """A real account's holdings as of its last sync. Each row is in its own
+def holdings(account_id: UUID, request: Request, response: Response, user: Principal = Depends(limit("expensive"))):
+    """A real account's holdings, live from the broker. Each row is in its own
     currency; `market_value_base` converts it to the user's base currency."""
+    jar = Jar.of(request, user.user_id)
+    c = jar.get(str(account_id))
     with db.user_tx(user.user_id) as conn:
-        account = _account(conn, account_id)
-        if account["kind"] != "real":
-            raise AppError("Paper accounts show positions, not synced holdings.")
+        if c is None:
+            _account(conn, account_id)
+            raise AppError("Paper accounts show positions, not broker holdings.")
         base = conn.execute("select base_currency from users").fetchone()["base_currency"]
-        rows = conn.execute("select symbol, broker_symbol, exchange, isin, quantity, avg_price, last_price, "
-                            "close_price, currency, synced_at from holdings where account_id = %s "
-                            "order by symbol", (account_id,)).fetchall()
+    rows = sorted(live_broker(jar, c, positions=False)[0], key=lambda r: r["symbol"])
+    response.headers.update(jar.headers())
+    as_of = datetime.now(timezone.utc)
+    account = {"id": c.id, "name": f"{broker_label(c)} {c.broker_user_id}"[:40],
+               "currency": ADAPTERS[c.broker].CURRENCY}
 
     rates: dict[str, Decimal | None] = {}
     for ccy in {r["currency"] for r in rows}:
@@ -259,16 +261,22 @@ def holdings(account_id: UUID, user: Principal = Depends(limit("standard"))):
         except Unavailable:
             rates[ccy] = None
 
-    out, total_value, total_invested, total_base = [], Decimal(0), Decimal(0), Decimal(0)
+    # Cost is unknown for some brokers (crypto balances), and a price can be
+    # missing; those parts are null and left out of totals rather than guessed.
+    out, total_value, total_invested, total_pnl, total_base = [], Decimal(0), Decimal(0), Decimal(0), Decimal(0)
     base_complete = True
     for r in rows:
         price = r["last_price"] or r["close_price"] or r["avg_price"]
-        value = r["quantity"] * price
-        invested = r["quantity"] * r["avg_price"]
+        value = r["quantity"] * price if price is not None else None
+        invested = r["quantity"] * r["avg_price"] if r["avg_price"] is not None else None
+        pnl = value - invested if value is not None and invested is not None else None
         rate = rates.get(r["currency"])
-        total_value += value
-        total_invested += invested
-        if rate is None:
+        if value is not None:
+            total_value += value
+        if pnl is not None:
+            total_invested += invested
+            total_pnl += pnl
+        if rate is None or value is None:
             base_complete = False
         else:
             total_base += value * rate
@@ -276,55 +284,48 @@ def holdings(account_id: UUID, user: Principal = Depends(limit("standard"))):
                if r["last_price"] is not None and r["close_price"] else None)
         out.append({"symbol": r["symbol"], "broker_symbol": r["broker_symbol"], "exchange": r["exchange"],
                     "isin": r["isin"], "quantity": format(r["quantity"].normalize(), "f"), "currency": r["currency"],
-                    "avg_price": _money(r["avg_price"]),
+                    "avg_price": _money(r["avg_price"]) if r["avg_price"] is not None else None,
                     "last_price": _money(r["last_price"]) if r["last_price"] is not None else None,
-                    "market_value": _money(value), "invested": _money(invested),
-                    "unrealized_pnl": _money(value - invested), "unrealized_pnl_pct": _pct(value - invested, invested),
+                    "market_value": _money(value) if value is not None else None,
+                    "invested": _money(invested) if invested is not None else None,
+                    "unrealized_pnl": _money(pnl) if pnl is not None else None,
+                    "unrealized_pnl_pct": _pct(pnl, invested) if pnl is not None else None,
                     "day_change_pct": day,
                     "fx_rate": str(rate) if rate is not None else None,
-                    "market_value_base": _money(value * rate) if rate is not None else None})
+                    "market_value_base": _money(value * rate) if rate is not None and value is not None else None})
 
     return {"account": {"id": str(account["id"]), "name": account["name"], "kind": "real",
                         "currency": account["currency"]},
-            "as_of": max((r["synced_at"] for r in rows), default=None),
+            "as_of": as_of,
             "base_currency": base,
             "holdings": out,
             "totals": {"market_value": _money(total_value), "invested": _money(total_invested),
-                       "unrealized_pnl": _money(total_value - total_invested),
-                       "unrealized_pnl_pct": _pct(total_value - total_invested, total_invested),
+                       "unrealized_pnl": _money(total_pnl),
+                       "unrealized_pnl_pct": _pct(total_pnl, total_invested),
                        "market_value_base": _money(total_base) if base_complete else None}}
 
 
 # ------------------------------------------------------------- performance --
 
 @router.get("/{account_id}/performance")
-def account_performance(account_id: UUID, user: Principal = Depends(limit("expensive")),
+def account_performance(account_id: UUID, request: Request, user: Principal = Depends(limit("expensive")),
                         period: Literal["1m", "3m", "6m", "1y", "ytd", "all"] = "6m"):
+    if Jar.of(request, user.user_id).get(str(account_id)) is not None:
+        # Broker data is never stored, so there is no history to measure.
+        return {"account_id": str(account_id), "kind": "real", "currency": "INR", "period": period,
+                "start": None, "end": None, "twr_pct": None, "xirr_pct": None, "series": [], "benchmark": None,
+                "method": "Broker accounts are read live and nothing is stored, so there is no history to chart.",
+                "xirr_note": "Performance over time is only kept for paper accounts."}
     today = date.today()
     with db.user_tx(user.user_id) as conn:
         account = _account(conn, account_id)
         start = performance.period_start(period, account["created_at"].date(), today)
-        if account["kind"] == "paper":
-            fills_ = conn.execute("select symbol, side, quantity, price, currency, fx_rate, fee, filled_at "
-                                  "from fills where account_id = %s", (account_id,)).fetchall()
-        else:
-            snaps = conn.execute("select on_date, market_value, invested from account_snapshots "
-                                 "where account_id = %s and on_date >= %s order by on_date",
-                                 (account_id, start - timedelta(days=7))).fetchall()
+        fills_ = conn.execute("select symbol, side, quantity, price, currency, fx_rate, fee, filled_at "
+                              "from fills where account_id = %s", (account_id,)).fetchall()
 
-    if account["kind"] == "paper":
-        dates, values = performance.paper_values(account, fills_, start, today)
-        flows = [0.0] * len(values)
-        method = "Paper: the fill ledger replayed against daily closes. No deposits or withdrawals."
-    else:
-        # Start from the last snapshot on or before the period start, if any.
-        snaps = [s for i, s in enumerate(snaps)
-                 if s["on_date"] >= start or (i + 1 < len(snaps) and snaps[i + 1]["on_date"] > start)]
-        dates = [s["on_date"] for s in snaps]
-        values = [float(s["market_value"]) for s in snaps]
-        flows = [0.0] + [float(snaps[i]["invested"] - snaps[i - 1]["invested"]) for i in range(1, len(snaps))]
-        method = ("Real: one value per day the account was synced. Money in and out is inferred from changes "
-                  "in cost basis, so gains realised by selling are understated.")
+    dates, values = performance.paper_values(account, fills_, start, today)
+    flows = [0.0] * len(values)
+    method = "Paper: the fill ledger replayed against daily closes. No deposits or withdrawals."
 
     result = {"account_id": str(account_id), "kind": account["kind"], "currency": account["currency"],
               "period": period, "start": dates[0].isoformat() if dates else None,

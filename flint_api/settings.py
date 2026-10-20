@@ -1,6 +1,6 @@
 """Runtime configuration, read once from the environment.
 
-Secrets come from `.env` (Neon, Gemini, Zerodha) and `.env.clerk` (Clerk), both
+Secrets come from `.env` (Neon, Gemini, the broker cookie key) and `.env.clerk` (Clerk), both
 gitignored. Nothing here is ever logged or returned by a route.
 """
 import base64
@@ -47,16 +47,10 @@ class Settings:
 
     max_body_bytes: int = 1024 * 1024
 
-    # Zerodha Kite Connect (read-only holdings sync). The secret signs the
-    # request-token exchange; the token key (32 bytes, base64) encrypts stored
-    # access tokens. Broker routes answer 503 until all three are set.
-    zerodha_api_key: str = field(default="", repr=False)
-    zerodha_api_secret: str = field(default="", repr=False)
+    # Encrypts the sealed broker cookies (32 bytes, base64). Every broker key
+    # comes from the user, kept in that cookie; broker routes answer 503 until
+    # this is set.
     broker_token_key: str = field(default="", repr=False)
-
-    @property
-    def zerodha_configured(self) -> bool:
-        return bool(self.zerodha_api_key and self.zerodha_api_secret and self.broker_token_key)
 
     @property
     def clerk_jwks_url(self) -> str:
@@ -75,8 +69,6 @@ def load() -> Settings:
         database_url_app=os.environ.get("DATABASE_URL_APP", ""),
         database_url_owner=os.environ.get("DATABASE_URL_UNPOOLED", ""),
         max_body_bytes=int(os.environ.get("MAX_CONTENT_LENGTH_BYTES", 1024 * 1024)),
-        zerodha_api_key=os.environ.get("ZERODHA_API_KEY", ""),
-        zerodha_api_secret=os.environ.get("ZERODHA_API_SECRET", ""),
         broker_token_key=os.environ.get("BROKER_TOKEN_KEY", ""),
     )
 

@@ -8,6 +8,7 @@ import agents_desk
 import ai_assistant
 import llm_router
 
+from .. import db
 from ..errors import Unavailable
 from ..ratelimit import limit
 from ..security import Principal, require_admin
@@ -65,13 +66,17 @@ def ai_chat(body: ChatBody):
 
 @router.post("/agents/run")
 def agents_run(body: DeskBody, user: Principal = Depends(limit("agents"))):
-    # The desk remembers and journals only this user's decisions.
+    # The desk keeps notes only in this user's journal, and sizes with this
+    # user's own risk-per-trade setting (None before onboarding).
     store = DbJournalStore(user.user_id)
+    with db.user_tx(user.user_id) as conn:
+        row = conn.execute("select risk_per_trade_pct from users").fetchone()
+    risk_pct = float(row["risk_per_trade_pct"]) if row and row["risk_per_trade_pct"] is not None else None
     if not body.stream:
         return agents_desk.run_desk_sync(body.symbol, portfolio=body.portfolio,
-                                         rounds=body.rounds, store=store)
+                                         rounds=body.rounds, store=store, risk_pct=risk_pct)
     return sse(agents_desk.run_desk(body.symbol, portfolio=body.portfolio,
-                                    rounds=body.rounds, store=store))
+                                    rounds=body.rounds, store=store, risk_pct=risk_pct))
 
 
 @router.get("/agents/routing")

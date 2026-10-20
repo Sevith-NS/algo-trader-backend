@@ -8,6 +8,7 @@ replaced with a fake that records what was asked.
 import base64
 import dataclasses
 import hashlib
+import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -16,20 +17,25 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from conftest import auth
-from flint_api import db, kite, performance, secretbox
+from flint_api import db, performance, secretbox
+from flint_api.brokers import zerodha as kite
 from flint_api.settings import settings
 
 needs_db = pytest.mark.skipif(not settings.database_url_app, reason="no DATABASE_URL_APP")
 KEY = base64.b64encode(b"k" * 32).decode()
 
 
+# The user's own Kite Connect app, entered in Settings; nothing is on the server.
+APP = {"api_key": "kitekey", "api_secret": "kitesecret"}
+CALLBACK = "https://polaris.example/settings/brokers/callback"
+
+
 @pytest.fixture()
 def configured(monkeypatch):
-    """Zerodha + token key configured, without touching the real .env."""
-    from flint_api.routers import brokers
-    s = dataclasses.replace(settings, zerodha_api_key="kitekey", zerodha_api_secret="kitesecret",
-                            broker_token_key=KEY)
-    for module in (kite, secretbox, brokers):
+    """Cookie key and a trusted frontend origin, without touching the real .env."""
+    from flint_api.routers import brokers as broker_routes
+    s = dataclasses.replace(settings, broker_token_key=KEY, authorized_parties=("https://polaris.example",))
+    for module in (secretbox, broker_routes):
         monkeypatch.setattr(module, "settings", s)
     return s
 
@@ -48,6 +54,14 @@ class FakeKite:
              "t1_quantity": 0, "average_price": 1400, "last_price": 1500, "close_price": 1500},
             {"tradingsymbol": "GOLDBEES", "exchange": "MCX", "quantity": 1, "average_price": 50},
         ]
+        self.positions = [
+            {"tradingsymbol": "TCS", "exchange": "NSE", "product": "MIS", "quantity": -3,
+             "average_price": 4000, "last_price": 3990, "close_price": 4010},
+            {"tradingsymbol": "RELIANCE", "exchange": "NSE", "product": "CNC", "quantity": 2,
+             "average_price": 2890, "last_price": 2900, "close_price": 2850},
+            {"tradingsymbol": "NIFTY26OCTFUT", "exchange": "NFO", "product": "NRML", "quantity": 50,
+             "average_price": 25000, "last_price": 25100, "close_price": 25050},
+        ]
 
     def __call__(self, method, url, headers=None, timeout=None, data=None, params=None):
         path = urlsplit(url).path
@@ -59,6 +73,8 @@ class FakeKite:
             if self.holdings_status == 403:
                 return _Resp(403, {"status": "error", "error_type": "TokenException", "message": "expired"})
             return _Resp(200, {"status": "success", "data": self.holdings})
+        if method == "GET" and path == "/portfolio/positions":
+            return _Resp(200, {"status": "success", "data": {"net": self.positions, "day": []}})
         if method == "DELETE" and path == "/session/token":
             return _Resp(200, {"status": "success", "data": True})
         return _Resp(404, {"status": "error"})
@@ -82,12 +98,12 @@ def fake_kite(monkeypatch):
 # ======================================================================= unit --
 
 def test_kite_checksum_and_login_url(configured):
-    assert kite.checksum("rt123") == hashlib.sha256(b"kitekeyrt123kitesecret").hexdigest()
-    url = urlsplit(kite.login_url("STATE_abc"))
+    assert kite.checksum(APP, "rt123") == hashlib.sha256(b"kitekeyrt123kitesecret").hexdigest()
+    url = urlsplit(kite.login_url("STATE_abc", APP, CALLBACK))
     q = parse_qs(url.query)
     assert url.netloc == "kite.zerodha.com" and q["api_key"] == ["kitekey"] and q["v"] == ["3"]
     assert parse_qs(q["redirect_params"][0]) == {"state": ["STATE_abc"]}
-    assert "kitesecret" not in kite.login_url("x")
+    assert "kitesecret" not in kite.login_url("x", APP, CALLBACK)
 
 
 def test_kite_session_ends_at_six_ist():
@@ -106,7 +122,7 @@ def test_kite_symbol_mapping(sym, exch, want):
 
 
 def test_kite_holdings_mapping(configured, fake_kite):
-    rows, skipped = kite.holdings("tok")
+    rows, skipped = kite.holdings("tok", APP)
     by = {r["symbol"]: r for r in rows}
     assert skipped == 1  # MCX
     assert by["RELIANCE.NS"]["quantity"] == 12  # T1 shares count
@@ -117,7 +133,7 @@ def test_kite_holdings_mapping(configured, fake_kite):
 def test_kite_expired_token(configured, fake_kite):
     fake_kite.holdings_status = 403
     with pytest.raises(kite.TokenExpired):
-        kite.holdings("tok")
+        kite.holdings("tok", APP)
 
 
 def test_secretbox_binds_owner_and_row(configured):
@@ -240,8 +256,7 @@ def test_new_routes_require_auth(client):
                  "/api/markets/pulse", f"/api/accounts/{uuid.uuid4()}/holdings",
                  f"/api/accounts/{uuid.uuid4()}/performance"):
         assert client.get(path).status_code == 401, path
-    for path in ("/api/brokers/zerodha/connect", "/api/brokers/zerodha/session", "/api/alerts",
-                 f"/api/brokers/{uuid.uuid4()}/sync"):
+    for path in ("/api/brokers/zerodha/connect", "/api/brokers/zerodha/session", "/api/alerts"):
         assert client.post(path, json={}).status_code == 401, path
 
 
@@ -267,10 +282,12 @@ def test_pulse_route(client, monkeypatch):
     assert client.get("/api/markets/pulse", headers=auth()).status_code == 503
 
 
-def test_connect_unconfigured_is_503(client, monkeypatch):
-    from flint_api.routers import brokers
-    monkeypatch.setattr(brokers, "settings", dataclasses.replace(settings, zerodha_api_secret=""))
-    assert client.post("/api/brokers/zerodha/connect", headers=auth()).status_code == 503
+def test_connect_without_cookie_key_is_503(client, configured, monkeypatch):
+    from flint_api.routers import brokers as broker_routes
+    monkeypatch.setattr(broker_routes, "settings", dataclasses.replace(configured, broker_token_key=""))
+    r = client.post("/api/brokers/zerodha/connect", headers=auth(),
+                    json={"app": APP, "keep": "30d", "redirect_uri": CALLBACK})
+    assert r.status_code == 503
 
 
 # ========================================================================= DB --
@@ -285,107 +302,154 @@ def users():
         db.forget_user(u)
 
 
-def _connect(client, user):
-    r = client.post("/api/brokers/zerodha/connect", headers=auth(user))
+class Browser:
+    """Plays the frontend BFF: keeps the pb_* cookies the API hands back in
+    X-Broker-Cookies and sends them on every call in X-Broker-Sessions."""
+
+    def __init__(self, client, user):
+        self.client, self.user, self.cookies = client, user, {}
+
+    def request(self, method, path, **kw):
+        headers = auth(self.user)
+        if self.cookies:
+            headers["x-broker-sessions"] = ";".join(f"{k}={v}" for k, v in self.cookies.items())
+        r = self.client.request(method, path, headers=headers, **kw)
+        for c in json.loads(r.headers.get("x-broker-cookies", "[]")):
+            if c["value"] is None:
+                self.cookies.pop(c["name"], None)
+            else:
+                self.cookies[c["name"]] = c["value"]
+        return r
+
+    def get(self, path, **kw):
+        return self.request("GET", path, **kw)
+
+    def post(self, path, **kw):
+        return self.request("POST", path, **kw)
+
+    def delete(self, path, **kw):
+        return self.request("DELETE", path, **kw)
+
+
+def _start(b, **body):
+    r = b.post("/api/brokers/zerodha/connect", json=body or {"app": APP, "keep": "30d", "redirect_uri": CALLBACK})
     assert r.status_code == 200, r.text
-    state = parse_qs(parse_qs(urlsplit(r.json()["redirect_url"]).query)["redirect_params"][0])["state"][0]
-    return state, client.post("/api/brokers/zerodha/session", headers=auth(user),
-                              json={"request_token": "reqtok12345", "state": state})
+    return parse_qs(parse_qs(urlsplit(r.json()["redirect_url"]).query)["redirect_params"][0])["state"][0]
+
+
+def _connect(b):
+    state = _start(b)
+    return state, b.post("/api/brokers/zerodha/session",
+                         json={"state": state, "params": {"request_token": "reqtok12345"}})
 
 
 @needs_db
-def test_broker_connect_sync_and_holdings(client, users, configured, fake_kite, monkeypatch):
+def test_broker_connect_and_live_holdings_store_nothing(client, users, configured, fake_kite, monkeypatch):
     import data_source
     monkeypatch.setattr(data_source, "get_quote", lambda s: {"symbol": s, "regularMarketPrice": 85.0})
     a, _ = users
-    _state, r = _connect(client, a)
+    b = Browser(client, a)
+    _state, r = _connect(b)
     assert r.status_code == 201, r.text
-    body = r.json()
-    assert body["connection"]["status"] == "connected" and body["connection"]["broker_user_id"] == "AB1234"
-    assert body["sync"]["holdings"] == 2 and body["sync"]["skipped"] == 1
+    conn = r.json()["connection"]
+    assert conn["status"] == "connected" and conn["broker_user_id"] == "AB1234" and conn["label"] == "Zerodha"
     # The exchange was signed with the secret, which never left the server otherwise.
     post = next(c for c in fake_kite.calls if c[0] == "POST")
     assert post[2]["checksum"] == hashlib.sha256(b"kitekeyreqtok12345kitesecret").hexdigest()
+    # The connection is one sealed cookie; the token isn't readable in it, and the state is used up.
+    assert set(b.cookies) == {"pb_" + conn["id"].replace("-", "")}
+    assert "acc_reqtok12345" not in next(iter(b.cookies.values()))
 
-    accounts = client.get("/api/accounts", headers=auth(a)).json()["accounts"]
+    accounts = b.get("/api/accounts").json()["accounts"]
     real = next(x for x in accounts if x["kind"] == "real")
-    assert real["starting_cash"] is None and real["broker"] == "zerodha"
+    assert real["id"] == conn["id"] and real["starting_cash"] is None and real["broker"] == "zerodha"
     assert real["sync"]["status"] == "connected"
 
-    with db.user_tx(a) as conn:
-        stored = conn.execute("select access_token_enc from broker_connections").fetchone()["access_token_enc"]
-    assert b"acc_reqtok12345" not in bytes(stored)
-
-    h = client.get(f"/api/accounts/{real['id']}/holdings", headers=auth(a)).json()
+    h = b.get(f"/api/accounts/{real['id']}/holdings").json()
     rel = next(x for x in h["holdings"] if x["symbol"] == "RELIANCE.NS")
     assert rel["quantity"] == "12" and rel["market_value"] == "34800.0000" and rel["currency"] == "INR"
     assert rel["unrealized_pnl"] == "4800.0000" and rel["day_change_pct"] == "1.75"
-    assert h["base_currency"] == "INR" and h["totals"]["market_value"] == "42300.0000"
+    assert h["base_currency"] == "INR" and h["totals"]["market_value"] == "42300.0000" and h["as_of"]
 
-    # Real accounts are read-only at the API...
-    r = client.post(f"/api/accounts/{real['id']}/orders", headers=auth(a), json={
+    # The broker watchlist: holdings and today's positions, one entry per symbol.
+    lists = b.get("/api/brokers/watchlist").json()["lists"]
+    assert len(lists) == 1 and lists[0]["connection"]["label"] == "Zerodha"
+    items = {i["symbol"]: i for i in lists[0]["items"]}
+    assert set(items) == {"RELIANCE.NS", "INFY.NS", "TCS.NS"}
+    assert items["RELIANCE.NS"]["held"] == "12" and items["RELIANCE.NS"]["position"] == "2"
+    assert items["TCS.NS"]["held"] is None and items["TCS.NS"]["position"] == "-3"
+
+    # Broker accounts take no orders: they aren't accounts in the database at all.
+    r = b.post(f"/api/accounts/{real['id']}/orders", json={
         "symbol": "AAPL", "side": "buy", "quantity": "1", "client_order_id": str(uuid.uuid4())})
-    assert r.status_code == 403
-    assert client.get(f"/api/accounts/{real['id']}/positions", headers=auth(a)).status_code == 403
-    # ...and in the database.
-    with pytest.raises(Exception):
-        with db.user_tx(a) as conn:
-            conn.execute("insert into fills (user_id, account_id, symbol, side, quantity, price, currency) "
-                         "values (%s, %s, 'AAPL', 'buy', 1, 1, 'USD')", (a, real["id"]))
+    assert r.status_code == 404
+    perf = b.get(f"/api/accounts/{real['id']}/performance").json()
+    assert perf["kind"] == "real" and perf["series"] == []
 
-    listed = client.get("/api/brokers", headers=auth(a)).json()
-    assert listed["connections"][0]["account_id"] == real["id"]
-    assert "access_token" not in str(listed) and listed["available"][0]["configured"] is True
+    # Nothing broker-related reached the database.
+    with db.user_tx(a) as c:
+        assert c.execute("select count(*) as n from accounts where kind <> 'paper'").fetchone()["n"] == 0
+        tables = {r["t"] for r in c.execute("select table_name as t from information_schema.tables "
+                                            "where table_schema = 'public'").fetchall()}
+    assert not tables & {"broker_connections", "broker_link_states", "holdings", "broker_positions",
+                         "account_snapshots"}
 
 
 @needs_db
-def test_broker_state_is_single_use_and_per_user(client, users, configured, fake_kite):
-    a, b = users
-    state, r = _connect(client, a)
+def test_broker_state_is_single_use_per_user_and_must_match(client, users, configured, fake_kite):
+    a, other = users
+    b = Browser(client, a)
+    state, r = _connect(b)
     assert r.status_code == 201
-    replay = client.post("/api/brokers/zerodha/session", headers=auth(a),
-                         json={"request_token": "reqtok12345", "state": state})
+    replay = b.post("/api/brokers/zerodha/session", json={"state": state, "params": {"request_token": "reqtok12345"}})
     assert replay.status_code == 403
-    # A state minted by A cannot be redeemed by B (login CSRF).
-    r = client.post("/api/brokers/zerodha/connect", headers=auth(a))
-    stolen = parse_qs(parse_qs(urlsplit(r.json()["redirect_url"]).query)["redirect_params"][0])["state"][0]
-    r = client.post("/api/brokers/zerodha/session", headers=auth(b),
-                    json={"request_token": "reqtok12345", "state": stolen})
+    # An echoed state that isn't this browser's is refused, and burns the pending one.
+    _start(b)
+    r = b.post("/api/brokers/zerodha/session", json={"state": "x" * 43, "params": {"request_token": "reqtok12345"}})
+    assert r.status_code == 403 and "pb_state" not in b.cookies
+    # Another user presenting A's cookies gets nothing: they are sealed to A.
+    stolen = Browser(client, other)
+    _start(b)
+    stolen.cookies = dict(b.cookies)
+    r = stolen.post("/api/brokers/zerodha/session", json={"params": {"request_token": "reqtok12345"}})
     assert r.status_code == 403
-    assert client.get("/api/brokers", headers=auth(b)).json()["connections"] == []
+    assert stolen.get("/api/brokers").json()["connections"] == []
+    assert all(x["kind"] == "paper" for x in stolen.get("/api/accounts").json()["accounts"])
 
 
 @needs_db
-def test_expired_session_needs_reconnect_and_disconnect_cascades(client, users, configured, fake_kite):
-    a, _ = users
-    _, r = _connect(client, a)
+def test_state_cookie_alone_completes_brokers_that_dont_echo_it(client, users, configured, fake_kite):
+    b = Browser(client, users[0])
+    _start(b)
+    r = b.post("/api/brokers/zerodha/session", json={"params": {"request_token": "reqtok12345"}})
+    assert r.status_code == 201, r.text
+    # Without a pending connect in this browser there is nothing to complete.
+    assert Browser(client, users[0]).post("/api/brokers/zerodha/session",
+                                          json={"params": {"request_token": "reqtok12345"}}).status_code == 403
+
+
+@needs_db
+def test_expired_session_needs_reconnect_and_disconnect_forgets(client, users, configured, fake_kite):
+    b = Browser(client, users[0])
+    _, r = _connect(b)
     conn_id = r.json()["connection"]["id"]
-    account_id = r.json()["connection"]["account_id"]
 
     fake_kite.holdings_status = 403
-    r = client.post(f"/api/brokers/{conn_id}/sync", headers=auth(a))
+    r = b.get(f"/api/accounts/{conn_id}/holdings")
     assert r.status_code == 409 and r.json()["code"] == "needs_reconnect"
-    assert client.get("/api/brokers", headers=auth(a)).json()["connections"][0]["status"] == "needs_reconnect"
-    # Holdings from the last good sync are kept, labelled with their time.
-    assert client.get(f"/api/accounts/{account_id}/holdings", headers=auth(a)).json()["as_of"]
+    assert b.get("/api/brokers").json()["connections"][0]["status"] == "needs_reconnect"
+    assert b.get("/api/brokers/watchlist").json()["lists"][0]["connection"]["status"] == "needs_reconnect"
 
-    assert client.delete(f"/api/brokers/{conn_id}", headers=auth(a)).status_code == 204
-    assert client.get("/api/brokers", headers=auth(a)).json()["connections"] == []
-    assert all(x["kind"] == "paper" for x in client.get("/api/accounts", headers=auth(a)).json()["accounts"])
-    with db.user_tx(a) as conn:
-        assert conn.execute("select count(*) as n from holdings").fetchone()["n"] == 0
-    assert client.delete(f"/api/brokers/{conn_id}", headers=auth(a)).status_code == 404
+    # Reconnecting reuses the saved app keys (none typed again) and keeps the id.
+    fake_kite.holdings_status = 200
+    state = _start(b, connection_id=conn_id, redirect_uri=CALLBACK)
+    r = b.post("/api/brokers/zerodha/session", json={"state": state, "params": {"request_token": "reqtok12345"}})
+    assert r.json()["connection"]["id"] == conn_id and r.json()["connection"]["status"] == "connected"
 
-
-@needs_db
-def test_other_users_connection_is_invisible(client, users, configured, fake_kite):
-    a, b = users
-    _, r = _connect(client, a)
-    conn_id = r.json()["connection"]["id"]
-    account_id = r.json()["connection"]["account_id"]
-    assert client.post(f"/api/brokers/{conn_id}/sync", headers=auth(b)).status_code == 404
-    assert client.delete(f"/api/brokers/{conn_id}", headers=auth(b)).status_code == 404
-    assert client.get(f"/api/accounts/{account_id}/holdings", headers=auth(b)).status_code == 404
+    assert b.delete(f"/api/brokers/{conn_id}").status_code == 204
+    assert any(c[0] == "DELETE" and c[1] == "/session/token" for c in fake_kite.calls)  # broker logout
+    assert b.cookies == {} and b.get("/api/brokers").json()["connections"] == []
+    assert b.delete(f"/api/brokers/{conn_id}").status_code == 404
 
 
 @needs_db
@@ -460,10 +524,10 @@ def test_paper_performance(client, users, monkeypatch):
 
 
 @needs_db
-def test_export_includes_new_tables_without_tokens(client, users, configured, fake_kite):
-    a, _ = users
-    _connect(client, a)
-    data = client.get("/api/me/export", headers=auth(a)).json()
-    for key in ("broker_connections", "holdings", "account_snapshots", "alerts", "alert_firings"):
-        assert key in data
-    assert "access_token_enc" not in str(data["broker_connections"])
+def test_export_has_no_broker_data(client, users, configured, fake_kite):
+    b = Browser(client, users[0])
+    _connect(b)
+    data = b.get("/api/me/export").json()
+    assert "alerts" in data and "alert_firings" in data
+    assert not {"broker_connections", "holdings", "broker_positions", "account_snapshots"} & set(data)
+    assert "AB1234" not in json.dumps(data)
