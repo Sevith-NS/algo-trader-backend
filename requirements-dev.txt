@@ -1,0 +1,3 @@
+# Local only: Vercel installs requirements.txt, so test tools stay out of the bundle.
+-r requirements.txt
+pytest==9.1.1
