@@ -8,42 +8,58 @@ in real numbers instead of hallucinating prices.
 """
 import os
 import json
+import logging
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 import quant_models
 import news_engine
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
-SYSTEM_PROMPT = """You are Flint AI, the in-app assistant of a personal portfolio
-management and stock screening platform. You help the user understand their
-portfolio, markets, risk, and the platform's quant signals.
+# Bounds on what one chat request can send to the billed model (audit finding 2).
+_MAX_HISTORY = 20
+_MAX_MESSAGE_CHARS = 4000
+_MAX_PORTFOLIO_CHARS = 4000
+_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+MODEL = "gemini-3.6-flash"
+
+SYSTEM_PROMPT = """You are the Polaris assistant, inside a read-only portfolio tracker and
+paper-trading tool. You help the user understand their portfolio, markets, risk,
+and how the platform's quant readings and plan levels are computed.
 
 Rules:
 - Ground every number you cite in the CONTEXT block provided. Never invent prices.
 - Be concise and direct: short paragraphs, bullet lists for multiple points.
-- When discussing a trade, always mention the risk side (stop level, position size).
-- You may explain the platform's quant metrics (z-score, ATR stops, Kelly sizing,
-  VaR, Sharpe) in plain language.
-- Always include a one-line reminder that this is educational analysis on a paper
-  trading platform, not financial advice, when giving trade-related opinions.
+- You explain; you never advise. Do not tell the user to buy, sell, hold, avoid,
+  add, trim or exit anything, and do not give price targets, ratings, convictions
+  or position sizes of your own. If asked "should I buy X?", explain what the data
+  shows on both sides and that the decision is theirs.
+- You may explain the platform's quant metrics (z-score, ATR stops, R multiples,
+  VaR, Sharpe) and how a plan's entry, stop and size were computed, in plain language.
+- Polaris is not a SEBI-registered investment adviser or research analyst. When a
+  question is about a trade, add one line saying this is information, not advice.
 """
 
 
 def _build_context(portfolio: dict, symbol: str | None) -> str:
     parts = []
     if portfolio:
-        parts.append("USER PORTFOLIO SNAPSHOT:\n" + json.dumps(portfolio, indent=2))
+        # Bounded and compact: every character here is billed (audit finding 2).
+        parts.append("USER PORTFOLIO SNAPSHOT:\n" + json.dumps(portfolio, default=str)[:_MAX_PORTFOLIO_CHARS])
     if symbol:
         try:
             signals = quant_models.get_quant_signals(symbol)
             if "error" not in signals:
-                parts.append(f"QUANT SIGNALS FOR {symbol}:\n" + json.dumps(signals, indent=2))
+                # Readings and levels only: no buy/sell label, conviction or engine size
+                # reaches the model, so it has none to repeat.
+                readings = {k: v for k, v in signals.items()
+                            if k not in ("signal", "action", "conviction", "position_sizing")}
+                parts.append(f"QUANT READINGS FOR {symbol}:\n" + json.dumps(readings, indent=2))
         except Exception:
             pass
         try:
@@ -63,26 +79,31 @@ def _build_context(portfolio: dict, symbol: str | None) -> str:
 
 def chat(messages: list, portfolio: dict | None = None, symbol: str | None = None):
     if not GEMINI_API_KEY:
-        return {"error": "GEMINI_API_KEY not found in environment variables. Add it to your .env file."}
+        return {"error": "The assistant isn't configured yet."}
 
     try:
         context = _build_context(portfolio or {}, symbol)
 
         # Gemini uses 'model' for assistant turns
         history = []
-        for m in messages[:-1]:
+        for m in messages[-_MAX_HISTORY:-1]:
             role = "model" if m.get("role") == "assistant" else "user"
-            history.append({"role": role, "parts": [m.get("content", "")]})
+            history.append(types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=(m.get("content") or "")[:_MAX_MESSAGE_CHARS])],
+            ))
 
-        last_user = messages[-1].get("content", "") if messages else ""
+        last_user = (messages[-1].get("content") or "")[:_MAX_MESSAGE_CHARS] if messages else ""
         prompt = f"CONTEXT (live data, cite from here):\n{context}\n\nUSER QUESTION:\n{last_user}"
 
-        model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=SYSTEM_PROMPT)
-        session = model.start_chat(history=history)
+        session = _client.chats.create(
+            model=MODEL,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            history=history,
+        )
         response = session.send_message(prompt)
 
         return {"reply": response.text}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("assistant chat failed")
+        return {"error": "The assistant is unavailable right now. Try again in a moment."}

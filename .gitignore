@@ -1,13 +1,54 @@
-venv/
-__pycache__/
-*.pyc
-.ca-bundle.pem
-.market_cache.json
-# Generated India market caches: rebuilt on demand from the NSE index archives
-# and the Groww instrument master. Snapshots, not source.
-.nse_segments.json
-.groww_instruments.json
+# ---------------------------------------------------------------- secrets ---
+# Real credentials never leave this machine. .env holds the Gemini key and the
+# Groww trading-API token/secret; only the template is committed.
 .env*
 !.env.example
-# macOS Finder metadata
+
+# ------------------------------------------------------------ environments ---
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ------------------------------------------------- generated runtime state ---
+# Trading-desk decision journal: written by agents_desk.py, plus the reflection
+# memory that scores it. Local to each deployment, not source.
+.agent_journal.json
+
+# Market/instrument caches: rebuilt on demand from Yahoo, the NSE index
+# archives and the Groww instrument master. Snapshots, not source.
+.market_cache.json
+.nse_segments.json
+.groww_instruments.json
+
+# Atomic-write temp files (agents_desk.py writes .tmp then renames).
+*.tmp
+
+# TLS bundle assembled by run.sh from the system keychain on macOS.
+.ca-bundle.pem
+
+# ------------------------------------------------------ tooling / editors ---
+# graphify knowledge graph: regenerate with `/graphify . --update`. Large,
+# generated, and goes stale the moment the source changes.
+graphify-out/
+.obsidian/
+.vscode/
+.idea/
+.gstack/
+.impeccable/
+
+# ------------------------------------------------------------------- noise ---
 .DS_Store
+Thumbs.db
+*.log
+.neon
+node_modules/
+
+# Agent tooling installed locally by `neon skills`
+.claude/
+skills-lock.json

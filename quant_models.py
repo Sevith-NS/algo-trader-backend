@@ -29,6 +29,7 @@ over a continuum of candidate limit prices.
              the target before the stop under drift implied by the signal.
   - Sizing:  half-Kelly on the trade's OWN P_win and R, capped at 25%.
 """
+import logging
 import numpy as np
 import pandas as pd
 
@@ -539,7 +540,6 @@ def get_quant_signals(symbol: str):
             "stop_loss": round(float(stop), 2),
             "take_profit": round(float(target_2), 2),
         }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "Signals are unavailable for this symbol right now."}

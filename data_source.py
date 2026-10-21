@@ -16,10 +16,13 @@ No auth bypass or scraping tricks — standard public JSON endpoints, browser UA
 low request volume.
 """
 import os
+import heapq
 import json
 import time
 import threading
+from collections import OrderedDict
 from contextlib import contextmanager
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -45,10 +48,31 @@ _throttle_lock = threading.Lock()
 _cache_lock = threading.Lock()
 
 # Corporate proxies that MITM TLS (self-signed cert in chain) break verification
-# for ALL outbound HTTPS. On first SSLError we fall back to unverified TLS and
-# remember. Acceptable trade-off here: public market data only, nothing sensitive
-# sent, and the proxy already terminates TLS anyway.
+# for ALL outbound HTTPS. The supported fix is to trust the proxy's CA —
+# run.sh already builds a bundle and exports REQUESTS_CA_BUNDLE for macOS, and
+# any platform can point that variable at the corporate root.
+#
+# Dropping verification is the fallback of last resort and is now opt-in only
+# (ALLOW_INSECURE_TLS=1). It used to trigger automatically on any SSLError
+# whose text mentioned a self-signed certificate, which meant an attacker on
+# the path could cause it: present a self-signed cert once, and this process
+# would stop verifying certificates for every outbound host for the rest of
+# its life — including the news feeds whose text is fed into LLM prompts.
+_ALLOW_INSECURE_TLS = os.environ.get("ALLOW_INSECURE_TLS") == "1"
 _ssl_state = {"verify": True}
+
+
+def web_link(url) -> str | None:
+    """A third-party link, kept only if it is plain http(s).
+
+    Feed entries are attacker-controllable text; a `javascript:` or `data:`
+    link rendered as an <a href> would run in the user's session. Anything
+    else becomes None, which the UI shows as unlinked text.
+    """
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    return url if url.lower().startswith(("https://", "http://")) and len(url) <= 2048 else None
 
 
 def http_get(url: str, params: dict | None = None, timeout: int = 15,
@@ -62,18 +86,15 @@ def http_get(url: str, params: dict | None = None, timeout: int = 15,
     try:
         return requests.get(url, params=params, headers=hdrs, timeout=timeout,
                             verify=_ssl_state["verify"])
-    except requests.exceptions.SSLError as e:
-        # Downgrade ONLY for the corporate-MITM signature (self-signed cert in
-        # chain) or an explicit opt-in — a transient handshake error or captive
-        # portal must not silently disable TLS verification for the process.
-        msg = str(e).lower()
-        mitm = "self signed certificate" in msg or "self-signed certificate" in msg
-        if _ssl_state["verify"] and (mitm or os.environ.get("ALLOW_INSECURE_TLS") == "1"):
+    except requests.exceptions.SSLError:
+        # Only an explicit operator opt-in downgrades verification. Inferring
+        # it from the error text let the error's own author choose.
+        if _ALLOW_INSECURE_TLS and _ssl_state["verify"]:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             _ssl_state["verify"] = False
-            print("[data_source] TLS interception detected (corporate proxy) — "
-                  "continuing without cert verification for public market data.")
+            print("[data_source] ALLOW_INSECURE_TLS=1 — certificate verification "
+                  "disabled for all outbound requests from this process.")
             return requests.get(url, params=params, headers=hdrs, timeout=timeout,
                                 verify=False)
         raise
@@ -92,10 +113,22 @@ def _load_disk() -> dict:
 _disk_cache = _load_disk()
 
 
-def _save_disk():
+# Bounds for the shared cache (audit finding 5). Keys are symbol-derived, so
+# without a cap the store, and the file dumped on every write, grew with every
+# distinct symbol ever requested; the dump also ran under the read lock.
+_MAX_CACHE_ENTRIES = 5000
+_SAVE_EVERY = 5.0  # seconds between whole-file dumps
+_save_state = {"ts": 0.0}
+_save_lock = threading.Lock()
+
+
+def _save_disk(snapshot: dict):
+    """Write a snapshot atomically: a crash mid-write never truncates the cache."""
+    tmp = CACHE_FILE + ".tmp"
     try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(_disk_cache, f)
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, CACHE_FILE)
     except Exception:
         pass
 
@@ -115,10 +148,22 @@ def _cache_get(key: str, fresh_ttl: float):
 
 def _cache_put(key: str, data):
     entry = {"ts": time.time(), "data": data}
+    snapshot = None
     with _cache_lock:
         _mem_cache[key] = entry
         _disk_cache[key] = entry
-        _save_disk()
+        if len(_disk_cache) > _MAX_CACHE_ENTRIES:
+            excess = len(_disk_cache) - _MAX_CACHE_ENTRIES
+            for old in heapq.nsmallest(excess, _disk_cache, key=lambda k: _disk_cache[k]["ts"]):
+                _disk_cache.pop(old, None)
+                _mem_cache.pop(old, None)
+        if entry["ts"] - _save_state["ts"] >= _SAVE_EVERY:
+            _save_state["ts"] = entry["ts"]
+            snapshot = dict(_disk_cache)
+    # Serialise outside the read lock so a dump never stalls cache readers.
+    if snapshot is not None:
+        with _save_lock:
+            _save_disk(snapshot)
 
 
 def _throttled(fn):
@@ -174,27 +219,27 @@ def _breaker_record(ok: bool):
 # key (screener fires 5 endpoints for one symbol; holdings-intel fans out),
 # only the first hits the network — the rest wait on the key's lock, then
 # re-read the now-warm cache. Classic cache-stampede protection.
-# Keys derive from user input (symbols), so idle locks are pruned to bound
-# memory; a pruned-and-recreated lock can at worst double-fetch a key idle
-# for 15+ minutes, which is a perf hiccup, not a correctness issue.
-_flight_locks: dict = {}
-_flight_last: dict = {}
+# Keys derive from user input (symbols), so the table is an LRU with a hard
+# cap: once full, the least recently used idle lock is evicted in O(1). The
+# old age-only prune could never evict under sustained traffic (audit finding
+# 10). A recreated lock can at worst double-fetch one key, never corrupt it.
+_flight_locks: "OrderedDict[str, threading.Lock]" = OrderedDict()
 _flight_guard = threading.Lock()
-_FLIGHT_STALE = 900  # seconds
-_FLIGHT_PRUNE_ABOVE = 256  # only bother pruning past this many keys
+_FLIGHT_MAX_KEYS = 512
 
 
 @contextmanager
 def _singleflight(key: str):
-    now = time.monotonic()
     with _flight_guard:
-        if len(_flight_locks) > _FLIGHT_PRUNE_ABOVE:
-            for k in [k for k, ts in _flight_last.items()
-                      if now - ts > _FLIGHT_STALE and not _flight_locks[k].locked()]:
-                _flight_locks.pop(k, None)
-                _flight_last.pop(k, None)
-        lock = _flight_locks.setdefault(key, threading.Lock())
-        _flight_last[key] = now
+        lock = _flight_locks.get(key)
+        if lock is None:
+            lock = _flight_locks[key] = threading.Lock()
+            # Evict idle locks oldest-first; an in-flight lock is never dropped.
+            for old in list(_flight_locks)[:max(0, len(_flight_locks) - _FLIGHT_MAX_KEYS)]:
+                if old != key and not _flight_locks[old].locked():
+                    del _flight_locks[old]
+        else:
+            _flight_locks.move_to_end(key)
     with lock:
         yield
 
@@ -247,10 +292,18 @@ def get_json_cached(key: str, url: str, params: dict | None = None,
 
 # ------------------------------------------------------- chart API parsing ---
 
-def _fetch_chart(symbol: str, range_: str = "1y", interval: str = "1d"):
-    """Returns (records, meta) from Yahoo's public v8 chart API."""
-    data = _get_json(_CHART_URL.format(symbol=symbol),
-                     {"range": range_, "interval": interval})
+def _fetch_chart(symbol: str, range_: str = "1y", interval: str = "1d",
+                 period1: int | None = None):
+    """Returns (records, meta) from Yahoo's public v8 chart API.
+
+    `period1` (a unix timestamp) asks for an explicit window instead of a range
+    string. That is the only way to get a real full history — see get_ohlc_max.
+    """
+    params = ({"period1": int(period1), "period2": int(time.time()),
+               "interval": interval}
+              if period1 is not None else
+              {"range": range_, "interval": interval})
+    data = _get_json(_CHART_URL.format(symbol=symbol), params)
     result = data["chart"]["result"][0]
     meta = result.get("meta", {})
     timestamps = result.get("timestamp") or []
@@ -380,6 +433,47 @@ def get_ohlc(symbol: str, range_: str = "1y", interval: str = "1d") -> list:
         return cached if cached is not None else []
 
 
+# Intervals that have a full history worth asking for. Intraday is capped by
+# MAX_RANGE_FOR_INTERVAL no matter how the request is phrased.
+FULL_HISTORY_INTERVALS = ("1d", "1wk", "1mo")
+
+
+def get_ohlc_max(symbol: str, interval: str = "1d") -> list:
+    """Every bar Yahoo holds for a daily-or-slower interval.
+
+    `range=max` with `interval=1d` does not mean what it looks like: Yahoo
+    quietly coarsens the result rather than returning tens of thousands of
+    candles — AAPL comes back as ~170 quarterly bars, not 10,000 daily ones,
+    which silently turns a decades-long backtest into a 169-point one. Asking
+    with an explicit period1/period2 window instead returns the real series.
+
+    Ranges of 10y and under are unaffected, so get_ohlc stays the right call
+    for everything else.
+    """
+    if interval not in FULL_HISTORY_INTERVALS:
+        return get_ohlc(symbol, range_=MAX_RANGE_FOR_INTERVAL.get(interval, "max"),
+                        interval=interval)
+
+    key = f"ohlcfull:{symbol}:{interval}"
+    cached, fresh = _cache_get(key, FRESH_TTL["history"])
+    if cached is not None and fresh:
+        return cached
+
+    with _singleflight(key):
+        cached, fresh = _cache_get(key, FRESH_TTL["history"])
+        if cached is not None and fresh:
+            return cached
+        try:
+            # 0 is before any listing; Yahoo clamps it to the symbol's own start.
+            records, _meta = _fetch_chart(symbol, interval=interval, period1=0)
+            if records:
+                _cache_put(key, records)
+                return records
+        except Exception:
+            pass
+        return cached if cached is not None else []
+
+
 def _df_to_records(df: pd.DataFrame) -> list:
     out = []
     for date, row in df.iterrows():
@@ -446,6 +540,28 @@ def get_quote(symbol: str) -> dict:
         return _fetch_quote(key, symbol, cached)
 
 
+def _previous_close(records: list[dict], meta: dict, price):
+    """Close of the session before the quote's session.
+
+    Matched by date in the exchange's own time zone: if the last candle is the
+    quote's session, the one before it is the previous close. Comparing prices
+    instead fails on float32 candles (336.6400146 vs 336.64), which made a
+    finished session look unchanged.
+    """
+    closes = [r["c"] for r in records]
+    if len(closes) >= 2 and meta.get("regularMarketTime"):
+        offset = meta.get("gmtoffset") or 0
+        session = time.gmtime(meta["regularMarketTime"] + offset)[:3]
+        try:
+            last = datetime.fromisoformat(records[-1]["t"]).timestamp()
+            return closes[-2] if time.gmtime(last + offset)[:3] == session else closes[-1]
+        except (KeyError, TypeError, ValueError):
+            pass
+    if len(closes) >= 2 and price:
+        return closes[-2] if abs(closes[-1] - price) <= 1e-6 * abs(price) else closes[-1]
+    return meta.get("previousClose") or meta.get("chartPreviousClose")
+
+
 def _fetch_quote(key: str, symbol: str, cached):
     """Uncached quote fetch — call only while holding the key's flight lock."""
     quote = None
@@ -455,11 +571,7 @@ def _fetch_quote(key: str, symbol: str, cached):
         closes = [r["c"] for r in records]
         if price is None and closes:
             price = closes[-1]
-        # previous session close: last candle before today's
-        prev = None
-        if len(closes) >= 2:
-            prev = closes[-2] if abs(closes[-1] - (price or 0)) < 1e-9 else closes[-1]
-        prev = meta.get("previousClose") or prev or meta.get("chartPreviousClose")
+        prev = _previous_close(records, meta, price)
         quote = {
             "symbol": symbol,
             "shortName": meta.get("shortName") or symbol,
@@ -472,6 +584,7 @@ def _fetch_quote(key: str, symbol: str, cached):
             "fiftyTwoWeekHigh": meta.get("fiftyTwoWeekHigh"),
             "fiftyTwoWeekLow": meta.get("fiftyTwoWeekLow"),
             "marketCap": None,
+            "regularMarketTime": meta.get("regularMarketTime"),
         }
         # enrich from cached yearly history if available (no extra network call)
         hist_cached, _ = _cache_get(f"hist:{symbol}:1y", STALE_TTL)

@@ -1,15 +1,27 @@
-flask
-flask-cors
-yfinance
-pandas
-numpy
-scipy
-requests
-xgboost
-scikit-learn
-vaderSentiment
-feedparser
-prophet
-google-generativeai
-python-dotenv
-plotly
+# Pinned to the versions this backend is developed and tested against.
+# Unpinned, a fresh install resolved whatever was newest on PyPI that day,
+# so the environment was neither reproducible nor auditable against a CVE
+# feed. Bump deliberately, then re-run the test_*.py suites.
+#
+# Run with `./run.sh` (uvicorn flint_api.main:app).
+yfinance==1.6.0
+pandas==3.0.5
+numpy==2.5.2
+scipy==1.18.0
+requests==2.34.2
+# CPU build: same `import xgboost`, without the Linux GPU (NCCL) libraries that
+# would push the Vercel bundle past its 500 MB limit.
+xgboost-cpu==3.4.1
+scikit-learn==1.9.0
+vaderSentiment==3.3.2
+feedparser==6.0.14
+prophet==1.4.0
+google-genai==2.19.0
+python-dotenv==1.2.3
+# Flint API (FastAPI) - Clerk auth, Neon Postgres, tests
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+pyjwt[crypto]==2.15.1
+psycopg[binary,pool]==3.3.6
+psycopg-pool==3.3.3
+pytest==9.1.1

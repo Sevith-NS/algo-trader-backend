@@ -6,6 +6,7 @@ from prophet import Prophet
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import logging
+import urllib.parse
 
 import data_source
 
@@ -82,7 +83,11 @@ def get_ml_insights(symbol):
 
         # 4. Sentiment Analysis (Google News RSS + Vader)
         analyzer = SentimentIntensityAnalyzer()
-        rss_url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&gl=US&ceid=US:en"
+        # Encode the symbol: it arrives straight from the query string, and
+        # unencoded it can inject its own `&` parameters or truncate the URL
+        # at a `#`. news_intel.py already quotes for the same reason.
+        rss_q = urllib.parse.quote(f"{symbol} stock")
+        rss_url = f"https://news.google.com/rss/search?q={rss_q}&hl=en-US&gl=US&ceid=US:en"
         feed = feedparser.parse(rss_url)
         
         scores = []
@@ -101,10 +106,9 @@ def get_ml_insights(symbol):
             "current_price": last_close,
             "fear_greed_index": fear_greed_index
         }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "The forecast is unavailable for this symbol right now."}
 
 def get_advanced_signals(symbol):
     try:
@@ -162,10 +166,9 @@ def get_advanced_signals(symbol):
             "atr": atr,
             "sma_20": sma_20
         }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "The forecast is unavailable for this symbol right now."}
 
 import scipy.optimize as sco
 
@@ -236,7 +239,6 @@ def portfolio_optimization(symbols):
             "asset_details": capm_returns
         }
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "The forecast is unavailable for this symbol right now."}

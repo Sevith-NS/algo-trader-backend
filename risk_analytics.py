@@ -9,6 +9,7 @@ computes on 1y of daily data:
   - Portfolio beta vs S&P 500
   - Correlation matrix, concentration (HHI), sector allocation
 """
+import logging
 import numpy as np
 import pandas as pd
 
@@ -38,7 +39,10 @@ def get_portfolio_analytics(positions: list, balance: float = 0.0):
                 prices[sym] = float(p.get("averagePrice", 0))
             sectors[sym] = data_source.get_sector(sym)
 
-        values = {p["symbol"]: p["shares"] * prices[p["symbol"]] for p in positions}
+        # fx_rate converts each holding into one base currency, so weights and
+        # money figures are comparable across a mixed-currency book.
+        values = {p["symbol"]: p["shares"] * prices[p["symbol"]] * float(p.get("fx_rate") or 1.0)
+                  for p in positions}
         invested = sum(values.values())
         total_equity = invested + balance
         if invested <= 0:
@@ -113,7 +117,6 @@ def get_portfolio_analytics(positions: list, balance: float = 0.0):
             "correlation_matrix": corr_matrix,
             "equity_curve": equity_curve,
         }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "Portfolio analytics are unavailable right now."}

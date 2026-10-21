@@ -1,0 +1,71 @@
+"""Per-symbol research: signals, forecasts, fundamentals, news, deep analysis."""
+from fastapi import APIRouter, Depends, Response
+
+import deep_analysis
+import fundamentals
+import ml_models
+import news_engine
+import news_intel
+import quant_models
+
+from ..ratelimit import limit
+from ..validators import Symbol
+from ._common import cache, unwrap
+
+router = APIRouter(tags=["symbol"])
+standard = Depends(limit("standard"))
+expensive = Depends(limit("expensive"))
+
+# Buy/sell labels, conviction and engine-suggested position sizes never leave
+# the API: Polaris shows readings and the user's own risk-based size, not
+# calls (SEBI RA rules; see docs/API.md). The AI desk still reads them
+# internally until it is rebuilt.
+_CALL_FIELDS = ("signal", "action", "conviction", "position_sizing")
+
+
+@router.get("/quant-signals", dependencies=[standard])
+def quant_signals(response: Response, symbol: Symbol):
+    result = unwrap(quant_models.get_quant_signals(symbol))
+    cache(response, 300)
+    return {k: v for k, v in result.items() if k not in _CALL_FIELDS}
+
+
+@router.get("/ml-insights", dependencies=[standard])
+def ml_insights(response: Response, symbol: Symbol):
+    result = unwrap(ml_models.get_ml_insights(symbol))
+    cache(response, 600)
+    # A 7-day price forecast on a named stock reads as a price target; dropped.
+    return {k: v for k, v in result.items() if k != "prophet_7d_forecast"}
+
+
+@router.get("/advanced-signals", dependencies=[standard])
+def advanced_signals(response: Response, symbol: Symbol):
+    result = unwrap(ml_models.get_advanced_signals(symbol))
+    cache(response, 600)
+    # The stop/take-profit here follow the dropped BUY/SELL label, so they go too.
+    return {k: v for k, v in result.items() if k not in (*_CALL_FIELDS, "stop_loss", "take_profit")}
+
+
+@router.get("/fundamentals", dependencies=[standard])
+def fundamentals_xray(response: Response, symbol: Symbol):
+    result = unwrap(fundamentals.get_fundamentals(symbol))
+    cache(response, 3600)
+    return result
+
+
+@router.get("/news/ticker", dependencies=[standard])
+def ticker_news(response: Response, symbol: Symbol):
+    cache(response, 300)
+    return news_engine.get_ticker_news(symbol)
+
+
+@router.get("/news-intel", dependencies=[standard])
+def ticker_news_intel(response: Response, symbol: Symbol):
+    result = unwrap(news_intel.get_news_intel(symbol))
+    cache(response, 300)
+    return result
+
+
+@router.get("/deep-analysis", dependencies=[expensive])
+def deep_analysis_route(symbol: Symbol, ai: bool = False):
+    return unwrap(deep_analysis.get_deep_analysis(symbol, include_ai=ai))

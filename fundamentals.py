@@ -18,6 +18,7 @@ does NOT claim to cover (no reliable free API exists): concall transcripts,
 MD&A tone, promoter pledge / shareholding pattern deltas. The frontend surfaces
 that gap honestly instead of papering over it.
 """
+import logging
 import time
 
 import data_source
@@ -436,7 +437,6 @@ def get_fundamentals(symbol: str) -> dict:
                 "Promoter pledge / shareholding pattern deltas",
             ],
         }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    except Exception:
+        logging.getLogger(__name__).exception("engine failure")
+        return {"error": "Fundamentals are unavailable for this symbol right now."}

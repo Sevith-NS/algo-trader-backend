@@ -12,6 +12,8 @@ from email.utils import parsedate_to_datetime
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+import data_source
+
 _analyzer = SentimentIntensityAnalyzer()
 
 CATEGORIES = {
@@ -63,7 +65,7 @@ def _fetch_category(key: str, query: str, max_articles: int = 10):
             source = entry.source.title
         articles.append({
             "title": title,
-            "link": entry.get("link"),
+            "link": data_source.web_link(entry.get("link")),
             "source": source,
             "published": published,
             "sentiment_score": round(score, 3),
