@@ -1,7 +1,6 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import xgboost as xgb
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import logging
@@ -35,32 +34,7 @@ def get_ml_insights(symbol):
             "stop_loss": s2    # Stop Loss
         }
 
-        # 2. XGBoost for Next-Day Direction Probability
-        df_full = df.copy()
-        df_full['Returns'] = df_full['Close'].pct_change()
-        df_full['SMA_10'] = df_full['Close'].rolling(window=10).mean()
-        df_full['SMA_50'] = df_full['Close'].rolling(window=50).mean()
-        
-        # Target: 1 if next day close > today close, else 0
-        df_full['Target'] = (df_full['Close'].shift(-1) > df_full['Close']).astype(int)
-        
-        features = ['Close', 'Returns', 'SMA_10', 'SMA_50', 'Volume']
-        df_ml = df_full.copy()
-        df_ml.dropna(inplace=True)
-        
-        if len(df_ml) > 100:
-            X = df_ml[features]
-            y = df_ml['Target']
-            
-            model = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42)
-            model.fit(X, y)
-            
-            latest_row = df_full.iloc[-1:][features]
-            prob_up = model.predict_proba(latest_row)[0][1]
-        else:
-            prob_up = 0.5
-
-        # 3. Sentiment Analysis (Google News RSS + Vader)
+        # 2. Sentiment Analysis (Google News RSS + Vader)
         analyzer = SentimentIntensityAnalyzer()
         # Encode the symbol: it arrives straight from the query string, and
         # unencoded it can inject its own `&` parameters or truncate the URL
@@ -80,7 +54,6 @@ def get_ml_insights(symbol):
 
         return {
             "pivots": pivots,
-            "xgboost_probability": float(prob_up),
             "current_price": last_close,
             "fear_greed_index": fear_greed_index
         }
