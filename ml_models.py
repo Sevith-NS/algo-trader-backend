@@ -2,16 +2,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from prophet import Prophet
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import logging
 import urllib.parse
 
 import data_source
-
-# Silence Prophet logging
-logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
 
 def get_ml_insights(symbol):
     try:
@@ -64,24 +60,7 @@ def get_ml_insights(symbol):
         else:
             prob_up = 0.5
 
-        # 3. Prophet Forecast (7-Days)
-        df_prophet = df.copy()
-        df_prophet.reset_index(inplace=True)
-        # Ensure timezone-naive dates for Prophet
-        if df_prophet['Date'].dt.tz is not None:
-            df_prophet['ds'] = df_prophet['Date'].dt.tz_localize(None)
-        else:
-            df_prophet['ds'] = df_prophet['Date']
-            
-        df_prophet['y'] = df_prophet['Close']
-        
-        prophet_model = Prophet(daily_seasonality=False, yearly_seasonality=True)
-        prophet_model.fit(df_prophet[['ds', 'y']])
-        future = prophet_model.make_future_dataframe(periods=7)
-        forecast = prophet_model.predict(future)
-        forecast_7d = forecast.iloc[-1]['yhat']
-
-        # 4. Sentiment Analysis (Google News RSS + Vader)
+        # 3. Sentiment Analysis (Google News RSS + Vader)
         analyzer = SentimentIntensityAnalyzer()
         # Encode the symbol: it arrives straight from the query string, and
         # unencoded it can inject its own `&` parameters or truncate the URL
@@ -102,7 +81,6 @@ def get_ml_insights(symbol):
         return {
             "pivots": pivots,
             "xgboost_probability": float(prob_up),
-            "prophet_7d_forecast": float(forecast_7d),
             "current_price": last_close,
             "fear_greed_index": fear_greed_index
         }

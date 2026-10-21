@@ -34,8 +34,7 @@ def quant_signals(response: Response, symbol: Symbol):
 def ml_insights(response: Response, symbol: Symbol):
     result = unwrap(ml_models.get_ml_insights(symbol))
     cache(response, 600)
-    # A 7-day price forecast on a named stock reads as a price target; dropped.
-    return {k: v for k, v in result.items() if k != "prophet_7d_forecast"}
+    return result
 
 
 @router.get("/advanced-signals", dependencies=[standard])

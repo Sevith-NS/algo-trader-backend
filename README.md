@@ -154,7 +154,7 @@ Vercel deploys the repo's default branch (`main`) to production. Either merge `f
 
 Open `https://<your-backend>.vercel.app/api/health` and look for `{"status":"ok"}`.
 
-The first request after a while can take several seconds, because the instance is starting and loading pandas, prophet and xgboost. Later requests are fast.
+The first request after a while can take several seconds, because the instance is starting and loading pandas and xgboost. Later requests are fast.
 
 ---
 
@@ -192,10 +192,9 @@ Environment variable changes on Vercel only take effect after a redeploy (**Depl
 | 500 errors on every signed-in page, health is fine | The database is unreachable or `DATABASE_URL_APP` is wrong. | Check the value on Vercel matches `.env`, then redeploy. |
 | 401 on every signed-in request in production only | The frontend URL is missing from `AUTHORIZED_PARTIES`. | Step 6, then redeploy the backend. |
 | The frontend gets a Vercel login page or 401 from the backend | `FLINT_API_URL` points to a **preview** URL, which Vercel protects. | Use the production URL, or turn off Deployment Protection for the backend. |
-| Build fails with a function size error | The bundle is over 500 MB. | Make sure `requirements.txt` says `xgboost-cpu`, not `xgboost`. Optionally remove `pytest` from it. |
+| Build fails with a function size error | The bundle is over 500 MB. | Make sure `requirements.txt` says `xgboost-cpu`, not `xgboost`, and that test tools stay in `requirements-dev.txt`. |
 | An AI desk run cuts off around 5 minutes | Vercel's time limit. | `maxDuration` in `vercel.json` (300 s is the Hobby maximum; Pro allows more). |
 | Market caches seem to reset | Vercel's disk is read-only, so caches live only as long as an instance. | Expected. Nothing breaks; the data is fetched again. |
-| `Importing plotly failed` at startup | Optional prophet plotting dependency. | Harmless; ignore. |
 
 ---
 
@@ -203,5 +202,5 @@ Environment variable changes on Vercel only take effect after a redeploy (**Depl
 
 - Entry point: `flint_api/main.py` (`app`)
 - Migrations: `db/migrations/*.sql`, applied by `db/migrate.py`
-- Tests: `.\venv\Scripts\python.exe -m pytest`
+- Tests: `pip install -r requirements-dev.txt`, then `.\venv\Scripts\python.exe -m pytest`
 - Environment variables: `flint_api/settings.py`

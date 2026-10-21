@@ -125,7 +125,7 @@ Scans that parse nothing are sent `no-store`, so an upstream outage isn't cached
 | GET | `/api/news-intel?symbol=` | Headlines scored for tone and sources. |
 | GET | `/api/deep-analysis?symbol=&ai=` | Fundamentals, technical structure and five `readings.pillars` (−1…+1, null if a source is down), with no blended call, conviction or "interesting price". `ai=true` adds a Gemini write-up that explains without recommending; only known sections are kept. `expensive`. |
 
-> **Regulatory note (2026-10-19):** Polaris shows readings, never calls. No buy/sell/hold label, conviction or engine-suggested size leaves these routes or the desk (`tests/test_no_calls.py`, `tests/test_desk_no_calls.py`). `/api/ml-insights` also drops the Prophet 7-day price forecast.
+> **Regulatory note (2026-10-19):** Polaris shows readings, never calls. No buy/sell/hold label, conviction or engine-suggested size leaves these routes or the desk (`tests/test_no_calls.py`, `tests/test_desk_no_calls.py`). `/api/ml-insights` has no price forecast.
 
 ## AI (`ai.py`)
 
