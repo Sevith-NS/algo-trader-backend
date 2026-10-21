@@ -9,10 +9,6 @@ pandas==3.0.5
 numpy==2.5.2
 scipy==1.18.0
 requests==2.34.2
-# CPU build: same `import xgboost`, without the Linux GPU (NCCL) libraries that
-# would push the Vercel bundle past its 500 MB limit.
-xgboost-cpu==3.4.1
-scikit-learn==1.9.0
 vaderSentiment==3.3.2
 feedparser==6.0.14
 google-genai==2.19.0
