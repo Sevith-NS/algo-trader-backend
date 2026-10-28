@@ -254,7 +254,7 @@ def _build() -> dict | None:
     warnings = []
     if missing_indices:
         warnings.append(
-            f"index lists unavailable: {', '.join(missing_indices)}")
+            f"Could not load these index lists ({', '.join(missing_indices)})")
 
     n50 = index_sets.get("nifty50", set())
     nn50 = index_sets.get("next50", set())
@@ -325,7 +325,7 @@ def _build() -> dict | None:
         if added_unranked:
             warnings.append(
                 f"{added_unranked} NSE cash-EQ companies sit outside every NSE "
-                f"size index; they are scanned and labelled 'Unranked'")
+                f"size index, so they are scanned and labelled Unranked")
 
         unlisted = []
         for sym, entry in members.items():
@@ -345,7 +345,7 @@ def _build() -> dict | None:
                 f"{len(unlisted)} index members absent from the Groww NSE "
                 f"cash master (e.g. {', '.join(sorted(unlisted)[:3])})")
     else:
-        warnings.append("Groww instrument master unavailable: no F&O or lot-size data")
+        warnings.append("The Groww instrument list is unavailable, so F&O and lot size are missing")
         for entry in members.values():
             entry.setdefault("tradeable", None)
             entry.setdefault("fno", None)

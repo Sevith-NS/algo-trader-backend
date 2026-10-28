@@ -159,7 +159,7 @@ def test_static_universe_shapes_and_currency_override():
     from the NSE constituent lists at scan time (see the dynamic tests)."""
     expected_counts = {
         "us_large": 48, "us_mid": 50, "us_small": 50,
-        "crypto": 12, "commodities": 25, "indices": 13,
+        "crypto": 12, "commodities": 25, "indices": 13, "bonds": 16,
     }
     assert set(se.UNIVERSES) == set(expected_counts)
     for uid, count in expected_counts.items():
@@ -180,11 +180,15 @@ def test_static_universe_shapes_and_currency_override():
     assert se._symbol_currency(se.UNIVERSES["crypto"], "BTC-USD") == "USD"
 
 
-def test_bonds_universe_is_gone():
-    """Removed deliberately. Guarded because a stray re-add would silently put
-    a rates board back in a picker that no longer has a place for it."""
-    assert "bonds" not in se.UNIVERSES
-    assert "bonds" not in se.all_universe_ids()
+def test_bonds_universe_covers_us_and_india():
+    """Bond ETFs stand in for bonds (no keyless bond-price feed). The picker
+    files them under their own Bonds group; NSE gilt ETFs quote in INR."""
+    bonds = se.UNIVERSES["bonds"]
+    assert "bonds" in se.all_universe_ids()
+    assert bonds["group"] == "Bonds" and "Bonds" in se.GROUP_ORDER
+    assert se._symbol_currency(bonds, "TLT") == "USD"
+    assert se._symbol_currency(bonds, "LTGILTBEES.NS") == "INR"
+    assert set(bonds["currencies"]) <= set(bonds["symbols"])
 
 
 def test_commodities_carry_only_symbols_yahoo_actually_serves():
@@ -315,7 +319,7 @@ def test_discover_include_untagged(monkeypatch=None):
 
 def test_screen_registry_integrity():
     screens = se.list_screens()["screens"]
-    assert len(screens) == 12
+    assert len(screens) == 20
     assert se.list_screens()["categories"] == se.CATEGORIES
     assert {s["category"] for s in screens} == set(se.CATEGORIES)
 
@@ -329,6 +333,42 @@ def test_screen_registry_integrity():
         # every advertised column resolves to a metric or a confirm value
         for key, _label in spec["columns"]:
             assert key in rich or key in conf, (spec["id"], key)
+
+
+def _passes(screen_id, **metrics):
+    return all(c.ok(metrics) for c in se._SCREEN_INDEX[screen_id]["conditions"])
+
+
+def test_chartink_metrics():
+    m = se._metrics_for(_series([100, 99, 100, 101, 102, 103, 104]))
+    assert m["up_streak"] == 5 and m["price_prev5"] == 99.0
+    assert se._metrics_for(_series([100, 101, 100]))["up_streak"] == 0
+    # 30-day range is the last 30 closes only: the opening 50 is outside it
+    m = se._metrics_for(_series([50] + [100] * 29 + [110]))
+    assert abs(m["range_30d_pct"] - 10.0) < 1e-9
+    # MACD waits for 60 bars; a steady uptrend has the fast EMA on top
+    assert se._metrics_for(_uptrend(n=59))["macd"] is None
+    up = se._metrics_for(_uptrend(n=120))
+    assert up["macd"] > 0 and up["rsi_14_prev"] is not None
+
+
+def test_chartink_screens_match_their_rules():
+    assert _passes("rsi_cross_30", rsi_14_prev=28.0, rsi_14=31.0)
+    assert not _passes("rsi_cross_30", rsi_14_prev=31.0, rsi_14=33.0)  # never oversold
+    assert _passes("rsi_cross_70", rsi_14_prev=72.0, rsi_14=69.0)
+    assert not _passes("rsi_cross_70", rsi_14_prev=69.0, rsi_14=68.0)
+    assert _passes("up_streak_5", up_streak=5) and not _passes("up_streak_5", up_streak=4)
+    assert _passes("macd_bull_cross", macd=1.1, macd_signal=1.0, macd_prev=0.9, macd_signal_prev=1.0)
+    assert not _passes("macd_bull_cross", macd=1.1, macd_signal=1.0, macd_prev=1.05, macd_signal_prev=1.0)
+    assert _passes("cross_above_200", price=101.0, sma200=100.0, price_prev5=98.0, sma200_prev5=99.0)
+    assert not _passes("cross_above_200", price=101.0, sma200=100.0, price_prev5=100.5, sma200_prev5=99.0)
+    assert _passes("sma20_cross_50", price=102.0, sma20=101.0, sma50=100.0, sma20_prev5=99.0, sma50_prev5=99.5)
+    assert not _passes("sma20_cross_50", price=102.0, sma20=101.0, sma50=100.0, sma20_prev5=100.0, sma50_prev5=99.5)
+    assert _passes("potential_breakout", dist_52w_high_pct=-4.0, range_30d_pct=9.0)
+    assert not _passes("potential_breakout", dist_52w_high_pct=-6.0, range_30d_pct=9.0)
+    # a year of lower closes ends on its own 52-week low
+    assert _passes("new_52w_low", **se._metrics_for(_series([200 - i * 0.5 for i in range(260)])))
+    assert not _passes("new_52w_low", **se._metrics_for(_uptrend()))
 
 
 def test_conditions_fail_closed_on_none():
