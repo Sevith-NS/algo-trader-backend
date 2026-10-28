@@ -123,7 +123,7 @@ Scans that parse nothing are sent `no-store`, so an upstream outage isn't cached
 | GET | `/api/fundamentals?symbol=` | Fundamentals X-ray. |
 | GET | `/api/news/ticker?symbol=` | Headlines for a symbol. |
 | GET | `/api/news-intel?symbol=` | Headlines scored for tone and sources. |
-| GET | `/api/deep-analysis?symbol=&ai=` | Fundamentals, technical structure and five `readings.pillars` (−1…+1, null if a source is down), with no blended call, conviction or "interesting price". `ai=true` adds a Gemini write-up that explains without recommending; only known sections are kept. `expensive`. |
+| GET | `/api/deep-analysis?symbol=&ai=` | Fundamentals, technical structure and five `readings.pillars` (−1…+1, null if a source is down), with no blended call, conviction or "interesting price". `narrative` is the newest saved AI write-up for the symbol (any user's) and `narrative_at` its IST day. `ai=true` writes a new one only when none was written today, and returns `narrative: null` if that write fails rather than the older note. It explains without recommending; only known sections are kept. `expensive`. |
 
 > **Regulatory note (2026-10-19):** Polaris shows readings, never calls. No buy/sell/hold label, conviction or engine-suggested size leaves these routes or the desk (`tests/test_no_calls.py`, `tests/test_desk_no_calls.py`). `/api/ml-insights` has no price forecast.
 
@@ -132,7 +132,7 @@ Scans that parse nothing are sent `no-store`, so an upstream outage isn't cached
 | Method | Path | What it does |
 |---|---|---|
 | POST | `/api/ai-chat` | Assistant chat. Up to 40 messages, with optional portfolio snapshot (capped at 20 KB) and symbol context. `expensive`. |
-| POST | `/api/agents/run` | **SSE.** The research desk (`agents_desk.py`). Events: `context`, 4× `analyst` (readings −1…+1), `debate` (case for strength vs caution), `summary` (balanced, how the plan was computed), `rules` (deterministic sizing from the user's own `risk_per_trade_pct`, no model), `journal`, `done`. No agent outputs a call, conviction, target or size. A note is kept per run. `agents` scope. |
+| POST | `/api/agents/run` | **SSE.** The research desk (`agents_desk.py`). Events: `context`, 4× `analyst` (readings −1…+1), `debate` (case for strength vs caution), `summary` (balanced, how the plan was computed), `rules` (deterministic sizing from the user's own `risk_per_trade_pct`, no model), `journal`, `done`. No agent outputs a call, conviction, target or size. A note is kept per run. The model's part (analysts, debate, summary) is saved per symbol, round count and IST day in `research_runs` and replayed to the next user without a model call; `context.portfolio`, `rules` and the note are always worked out for the caller, and `context.as_of` is when the data was read. Only a run with every seat filed is saved, and the run stops with an `error` event when no analyst could file. `agents` scope. |
 | GET | `/api/agents/routing` | Admin only. Where model calls are being routed. |
 
 ## Portfolio analytics (`portfolio.py`)
@@ -199,7 +199,8 @@ Alerts trigger when price crosses above or below a level, or when the day's move
 | Yahoo Finance (`query1`/`query2.finance.yahoo.com`) | Quotes, charts, search, FX, fundamentals | Unofficial and free. Quotes can be delayed. |
 | NSE (`nseindia.com`, `nsearchives.nseindia.com`) | Index constituents, segments, movers universe | Public pages. Mind NSE's terms on redistribution. |
 | Google News RSS, Bing | Headlines | |
-| Google Gemini | AI chat, desk seats, deep-analysis write-up | Routed through `llm_router.py`. |
+| Google Gemini | AI chat, desk seats, deep-analysis write-up | Routed through `llm_router.py`. With `OMNIROUTE_PRIMARY=1` the desk and the write-up call an OpenAI-compatible server first (e.g. a local Ollama model) and Gemini becomes the fallback. AI chat still uses Gemini only. |
+| Neon Postgres (`research_runs`) | Saved desk runs and write-ups | Shared by every user, no row-level security: rows hold symbol data only, never user data. |
 | Clerk (`api.clerk.com`) | Token verification (JWKS), account deletion | |
 | Neon Postgres | Users, paper accounts, fills, watchlists, alerts, journal | Row-level security keyed to the Clerk user id. No broker data. |
 | Zerodha Kite Connect (`api.kite.trade`) | Session exchange, holdings, positions, logout | Read-only calls only. |

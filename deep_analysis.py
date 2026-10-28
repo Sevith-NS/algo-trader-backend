@@ -23,6 +23,7 @@ Three layers, each honest about what it is:
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -30,12 +31,14 @@ from dotenv import load_dotenv
 
 import data_source
 import fundamentals
+import llm_router
 import news_intel
 import quant_models
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 _MODEL = "gemini-3.6-flash"
+_IST = timezone(timedelta(hours=5, minutes=30))  # the teardown's day, as the store counts it
 
 
 # ------------------------------------------------------ technical structure ---
@@ -287,16 +290,18 @@ def _company_profile(symbol: str) -> dict | None:
 
 
 def _narrative(symbol: str, company: str, payload: dict) -> dict | None:
-    if not _GEMINI_KEY:
+    if not (_GEMINI_KEY or llm_router.PRIMARY):
         return None
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=_GEMINI_KEY)
         prompt = _NARRATIVE_PROMPT.format(
             symbol=symbol, company=company,
             data=json.dumps(payload, default=str)[:24000],
         )
+        if llm_router.PRIMARY:
+            return llm_router.call_json(prompt)
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=_GEMINI_KEY)
         resp = client.models.generate_content(
             model=_MODEL,
             contents=prompt,
@@ -330,7 +335,20 @@ def _sanitize_narrative(narrative):
 
 # -------------------------------------------------------------- entry point ---
 
-def get_deep_analysis(symbol: str, include_ai: bool = False) -> dict:
+def _saved_teardown(runs, symbol: str):
+    if runs is None:
+        return None
+    try:
+        return runs.latest("teardown", symbol)
+    except Exception:  # a dead store hides the old note, it never fails the page
+        logging.getLogger(__name__).exception("saved teardown read failed")
+        return None
+
+
+def get_deep_analysis(symbol: str, include_ai: bool = False, runs=None) -> dict:
+    """Numbers always; the teardown is the newest one saved in `runs`, and
+    include_ai writes a new one only when none was written today. A teardown
+    holds no user data, so one per symbol per day serves every user."""
     fund = fundamentals.get_fundamentals(symbol)
     tech = get_technical_structure(symbol)
     quant = quant_models.get_quant_signals(symbol)
@@ -348,10 +366,10 @@ def get_deep_analysis(symbol: str, include_ai: bool = False) -> dict:
         "quant": ({"composite_score": quant.get("composite_score")}
                   if "error" not in quant else None),
         "readings": readings,
-        "narrative": None,
     }
 
-    if include_ai:
+    saved = _saved_teardown(runs, symbol)
+    if include_ai and not (saved and saved["today"]):
         company = news.get("company") or symbol
         ai_payload = {
             "fundamentals": {k: fund.get(k) for k in
@@ -367,8 +385,19 @@ def get_deep_analysis(symbol: str, include_ai: bool = False) -> dict:
             # best-effort keyless profile — None whenever Yahoo gates the endpoint
             "company_profile": _company_profile(symbol),
         }
-        result["narrative"] = _sanitize_narrative(_narrative(symbol, company, ai_payload))
+        fresh = _sanitize_narrative(_narrative(symbol, company, ai_payload))
+        # A failed rewrite returns no note, so an older one is never passed off as new.
+        saved = None
+        if fresh:
+            saved = {"payload": fresh, "day": datetime.now(_IST).date().isoformat()}
+            if runs is not None:
+                try:
+                    runs.put("teardown", symbol, "", fresh)
+                except Exception:
+                    logging.getLogger(__name__).exception("teardown write failed")
 
+    result["narrative"] = saved["payload"] if saved else None
+    result["narrative_at"] = saved["day"] if saved else None
     return result
 
 

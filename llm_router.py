@@ -20,6 +20,9 @@ STRICT FALLBACK, on purpose:
   - If OmniRoute is not installed or not running, every function here degrades
     to "unavailable" and the caller behaves exactly as it did before.
 
+OMNIROUTE_PRIMARY=1 flips the order for any OpenAI-compatible server, such as a
+local Ollama model: every call goes there first and Gemini becomes the fallback.
+
 Availability is probed lazily and cached, so an absent gateway costs one failed
 connection per minute rather than one per model call.
 """
@@ -41,6 +44,10 @@ API_KEY = os.environ.get("OMNIROUTE_API_KEY", "")
 MODEL = os.environ.get("OMNIROUTE_MODEL", "auto")
 # Hard off-switch. Absent or "1" leaves the fallback armed but dormant.
 ENABLED = os.environ.get("OMNIROUTE_ENABLED", "1") != "0"
+PRIMARY = ENABLED and os.environ.get("OMNIROUTE_PRIMARY", "0") == "1"
+# Sent only when set: "none" turns thinking off on Ollama's thinking models,
+# which the desk's short JSON answers do not need. Other gateways may reject it.
+REASONING_EFFORT = os.environ.get("OMNIROUTE_REASONING_EFFORT", "")
 
 REQUEST_TIMEOUT = float(os.environ.get("OMNIROUTE_TIMEOUT", "180"))
 
@@ -244,6 +251,8 @@ def call_json(prompt: str, model: str | None = None, timeout: float | None = Non
         # The desk wants a whole answer per seat, so opt out explicitly.
         "stream": False,
     }
+    if REASONING_EFFORT:
+        payload["reasoning_effort"] = REASONING_EFFORT
     delay = _CALL_BACKOFF
     last = "unknown error"
     for attempt in range(_CALL_ATTEMPTS):
@@ -299,6 +308,7 @@ def status() -> dict:
     """Diagnostic snapshot for the /api/agents/routing route."""
     return {
         "enabled": ENABLED,
+        "primary": PRIMARY,
         "base_url": BASE_URL,
         "model": MODEL,
         "has_key": bool(API_KEY),

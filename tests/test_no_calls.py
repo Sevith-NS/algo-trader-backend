@@ -28,3 +28,49 @@ def test_narrative_keeps_only_known_sections():
            "bull_case": ["not", "a", "string"]}
     assert deep_analysis._sanitize_narrative(raw) == {"one_liner": "Margins are flat."}
     assert deep_analysis._sanitize_narrative(["BUY"]) is None
+
+
+class _Teardowns:
+    def __init__(self, row=None):
+        self.row, self.writes = row, []
+
+    def latest(self, kind, symbol, variant=""):
+        return self.row
+
+    def put(self, kind, symbol, variant, payload):
+        self.writes.append(payload)
+        self.row = {"payload": payload, "day": "2026-10-28", "today": True}
+
+
+def _stub_engines(monkeypatch, notes):
+    """No data and no model: `notes` is what the model would write, call by call."""
+    monkeypatch.setattr(deep_analysis.fundamentals, "get_fundamentals", lambda s: {"error": "x"})
+    monkeypatch.setattr(deep_analysis, "get_technical_structure", lambda s: {"error": "x"})
+    monkeypatch.setattr(deep_analysis.quant_models, "get_quant_signals", lambda s: {"error": "x"})
+    monkeypatch.setattr(deep_analysis.news_intel, "get_news_intel", lambda s, max_total=20: {
+        "stance": "neutral", "rating": 50, "confidence": 0.5, "weighted_score": 0.0, "article_count": 0,
+        "distinct_outlets": 0, "breakdown": {}, "articles": []})
+    monkeypatch.setattr(deep_analysis, "_company_profile", lambda s: None)
+    monkeypatch.setattr(deep_analysis, "_narrative", lambda *a: notes.pop(0) if notes else None)
+
+
+def test_the_teardown_is_written_once_a_day_and_shown_on_open(monkeypatch):
+    _stub_engines(monkeypatch, [{"one_liner": "Margins held."}])
+    runs = _Teardowns()
+
+    assert deep_analysis.get_deep_analysis("ZZ", runs=runs)["narrative"] is None
+    first = deep_analysis.get_deep_analysis("ZZ", include_ai=True, runs=runs)
+    again = deep_analysis.get_deep_analysis("ZZ", include_ai=True, runs=runs)  # a second write would get None
+    opened = deep_analysis.get_deep_analysis("ZZ", runs=runs)
+
+    assert first["narrative"] == again["narrative"] == opened["narrative"] == {"one_liner": "Margins held."}
+    assert len(runs.writes) == 1 and opened["narrative_at"] == "2026-10-28"
+
+
+def test_a_failed_rewrite_never_passes_off_the_old_teardown(monkeypatch):
+    _stub_engines(monkeypatch, [])
+    runs = _Teardowns({"payload": {"one_liner": "Old."}, "day": "2026-10-01", "today": False})
+
+    assert deep_analysis.get_deep_analysis("ZZ", include_ai=True, runs=runs)["narrative"] is None
+    opened = deep_analysis.get_deep_analysis("ZZ", runs=runs)
+    assert opened["narrative"] == {"one_liner": "Old."} and opened["narrative_at"] == "2026-10-01"
