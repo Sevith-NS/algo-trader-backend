@@ -95,7 +95,8 @@ def discover(response: Response, universe: RegistryId = "us_large", all: bool = 
 @router.get("/screens", dependencies=[standard])
 def screens(response: Response):
     cache(response, 3600)
-    return screener_engine.list_screens()
+    # The universe picker on the Screens tab needs the list before any scan runs.
+    return {**screener_engine.list_screens(), "universes": screener_engine._universe_index()}
 
 
 @router.get("/screens/run", dependencies=[standard])
