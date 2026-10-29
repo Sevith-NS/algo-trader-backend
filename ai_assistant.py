@@ -1,5 +1,6 @@
 """
-Portfolio-aware AI trading assistant backed by Gemini.
+Portfolio-aware AI trading assistant backed by Gemini, or by the llm_router
+gateway first (e.g. a local Ollama model) when OMNIROUTE_PRIMARY=1.
 
 The frontend sends the chat history plus a live snapshot of the user's paper
 portfolio (and optionally the symbol currently on screen). We enrich the
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+import llm_router
 import quant_models
 import news_engine
 
@@ -78,7 +80,7 @@ def _build_context(portfolio: dict, symbol: str | None) -> str:
 
 
 def chat(messages: list, portfolio: dict | None = None, symbol: str | None = None):
-    if not GEMINI_API_KEY:
+    if not (GEMINI_API_KEY or llm_router.PRIMARY):
         return {"error": "The assistant isn't configured yet."}
 
     try:
@@ -95,6 +97,18 @@ def chat(messages: list, portfolio: dict | None = None, symbol: str | None = Non
 
         last_user = (messages[-1].get("content") or "")[:_MAX_MESSAGE_CHARS] if messages else ""
         prompt = f"CONTEXT (live data, cite from here):\n{context}\n\nUSER QUESTION:\n{last_user}"
+
+        if llm_router.PRIMARY:
+            turns = [{"role": "system", "content": SYSTEM_PROMPT}]
+            turns += [{"role": "assistant" if m.get("role") == "assistant" else "user",
+                       "content": (m.get("content") or "")[:_MAX_MESSAGE_CHARS]}
+                      for m in messages[-_MAX_HISTORY:-1]]
+            turns.append({"role": "user", "content": prompt})
+            try:
+                return {"reply": llm_router.call_chat(turns)}
+            except (llm_router.RouterUnavailable, llm_router.FallbackFailed):
+                if _client is None:
+                    raise  # no Gemini key to fall back to
 
         session = _client.chats.create(
             model=MODEL,

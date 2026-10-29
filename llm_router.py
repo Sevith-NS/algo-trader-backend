@@ -236,6 +236,15 @@ def call_json(prompt: str, model: str | None = None, timeout: float | None = Non
     can fall back to their existing behaviour. Raises FallbackFailed when the
     gateway answered but could not deliver, after exhausting its own retries.
     """
+    return _complete([{"role": "user", "content": prompt}], True, model, timeout)
+
+
+def call_chat(messages: list, model: str | None = None, timeout: float | None = None) -> str:
+    """One plain-text turn over a system/user/assistant history. Same errors as call_json."""
+    return _complete(messages, False, model, timeout)
+
+
+def _complete(messages: list, json_mode: bool, model: str | None, timeout: float | None):
     if not ENABLED:
         raise RouterUnavailable("OmniRoute fallback is disabled (OMNIROUTE_ENABLED=0).")
     if not is_available():
@@ -244,13 +253,14 @@ def call_json(prompt: str, model: str | None = None, timeout: float | None = Non
 
     payload = {
         "model": model or MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
+        "messages": messages,
         # OmniRoute streams by default even when the client did not ask, which
         # yields SSE frames where an OpenAI client expects one JSON object.
         # The desk wants a whole answer per seat, so opt out explicitly.
         "stream": False,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
     if REASONING_EFFORT:
         payload["reasoning_effort"] = REASONING_EFFORT
     delay = _CALL_BACKOFF
@@ -283,8 +293,8 @@ def call_json(prompt: str, model: str | None = None, timeout: float | None = Non
             content = (choices[0].get("message") or {}).get("content")
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("empty message content")
-            parsed = json.loads(_strip_fence(content))
-            if not isinstance(parsed, dict):
+            parsed = json.loads(_strip_fence(content)) if json_mode else content.strip()
+            if json_mode and not isinstance(parsed, dict):
                 raise ValueError("non-object JSON payload")
         except (ValueError, json.JSONDecodeError) as exc:
             # A different upstream on the next attempt may well format correctly.

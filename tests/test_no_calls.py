@@ -67,6 +67,29 @@ def test_the_teardown_is_written_once_a_day_and_shown_on_open(monkeypatch):
     assert len(runs.writes) == 1 and opened["narrative_at"] == "2026-10-28"
 
 
+def test_ask_polaris_runs_on_the_gateway_with_its_rules_and_live_context(monkeypatch):
+    import ai_assistant
+    sent = []
+    monkeypatch.setattr(ai_assistant.llm_router, "PRIMARY", True)
+    monkeypatch.setattr(ai_assistant.llm_router, "call_chat", lambda turns: sent.append(turns) or "Margins held.")
+    monkeypatch.setattr(ai_assistant, "_build_context", lambda portfolio, symbol: "QUANT READINGS FOR ZZ: {}")
+
+    reply = ai_assistant.chat([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"},
+                               {"role": "user", "content": "How is ZZ doing?"}], symbol="ZZ")
+
+    turns = sent[0]
+    assert reply == {"reply": "Margins held."}
+    assert turns[0] == {"role": "system", "content": ai_assistant.SYSTEM_PROMPT}
+    assert [t["role"] for t in turns[1:]] == ["user", "assistant", "user"]
+    assert "QUANT READINGS FOR ZZ" in turns[-1]["content"] and "How is ZZ doing?" in turns[-1]["content"]
+
+    def down(turns):
+        raise ai_assistant.llm_router.RouterUnavailable("down")
+    monkeypatch.setattr(ai_assistant.llm_router, "call_chat", down)
+    monkeypatch.setattr(ai_assistant, "_client", None)
+    assert "error" in ai_assistant.chat([{"role": "user", "content": "Hi"}])
+
+
 def test_a_failed_rewrite_never_passes_off_the_old_teardown(monkeypatch):
     _stub_engines(monkeypatch, [])
     runs = _Teardowns({"payload": {"one_liner": "Old."}, "day": "2026-10-01", "today": False})

@@ -199,7 +199,7 @@ Alerts trigger when price crosses above or below a level, or when the day's move
 | Yahoo Finance (`query1`/`query2.finance.yahoo.com`) | Quotes, charts, search, FX, fundamentals | Unofficial and free. Quotes can be delayed. |
 | NSE (`nseindia.com`, `nsearchives.nseindia.com`) | Index constituents, segments, movers universe | Public pages. Mind NSE's terms on redistribution. |
 | Google News RSS, Bing | Headlines | |
-| Google Gemini | AI chat, desk seats, deep-analysis write-up | Routed through `llm_router.py`. With `OMNIROUTE_PRIMARY=1` the desk and the write-up call an OpenAI-compatible server first (e.g. a local Ollama model) and Gemini becomes the fallback. AI chat still uses Gemini only. |
+| Google Gemini | AI chat, desk seats, deep-analysis write-up | Routed through `llm_router.py`. With `OMNIROUTE_PRIMARY=1` the desk, the write-up and AI chat (Ask Polaris) call an OpenAI-compatible server first (e.g. a local Ollama model) and Gemini becomes the fallback. |
 | Neon Postgres (`research_runs`) | Saved desk runs and write-ups | Shared by every user, no row-level security: rows hold symbol data only, never user data. |
 | Clerk (`api.clerk.com`) | Token verification (JWKS), account deletion | |
 | Neon Postgres | Users, paper accounts, fills, watchlists, alerts, journal | Row-level security keyed to the Clerk user id. No broker data. |
