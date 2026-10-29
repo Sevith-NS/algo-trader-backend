@@ -10,11 +10,13 @@ in real numbers instead of hallucinating prices.
 import os
 import json
 import logging
+import re
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+import data_source
 import llm_router
 import quant_models
 import news_engine
@@ -36,6 +38,9 @@ and how the platform's quant readings and plan levels are computed.
 
 Rules:
 - Ground every number you cite in the CONTEXT block provided. Never invent prices.
+  CONTEXT holds live readings and headlines for the companies the user names. If a
+  named company has no block, say its data could not be fetched; do not say you have
+  no access to market data.
 - Be concise and direct: short paragraphs, bullet lists for multiple points.
 - You explain; you never advise. Do not tell the user to buy, sell, hold, avoid,
   add, trim or exit anything, and do not give price targets, ratings, convictions
@@ -48,12 +53,48 @@ Rules:
 """
 
 
-def _build_context(portfolio: dict, symbol: str | None) -> str:
+_MAX_MENTIONED = 3
+_TICKER = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=&^]{0,23}$")  # validators.SYMBOL_PATTERN, upper-case
+
+
+def _mentioned(text: str) -> list:
+    """Yahoo tickers for the companies a question names ("google and meta" ->
+    GOOGL, META), so their data is fetched too. The model only names the
+    companies (small models guess tickers badly); Yahoo's search finds the
+    symbol. Best effort: [] on any failure."""
+    prompt = ('List the listed companies named in this message, as the user wrote them '
+              '(a ticker they typed counts). Respond as JSON: {"companies": ["..."]}, at most '
+              f'{_MAX_MENTIONED}, [] if none.\n\nMESSAGE:\n{text}')
+    try:
+        if llm_router.PRIMARY:
+            raw = llm_router.call_json(prompt)
+        elif _client:
+            raw = json.loads(_client.models.generate_content(
+                model=MODEL, contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json")).text)
+        else:
+            return []
+        found = []
+        for name in [str(c).strip()[:60] for c in raw.get("companies", [])][:_MAX_MENTIONED]:
+            try:
+                hits = data_source.http_get("https://query1.finance.yahoo.com/v1/finance/search",
+                                            {"q": name, "quotesCount": 5, "newsCount": 0}).json()["quotes"]
+            except Exception:
+                continue
+            top = next((h["symbol"].upper() for h in hits if h.get("quoteType") == "EQUITY"), None)
+            if top and _TICKER.match(top):
+                found.append(top)
+        return found
+    except Exception:
+        return []
+
+
+def _build_context(portfolio: dict, symbols: list) -> str:
     parts = []
     if portfolio:
         # Bounded and compact: every character here is billed (audit finding 2).
         parts.append("USER PORTFOLIO SNAPSHOT:\n" + json.dumps(portfolio, default=str)[:_MAX_PORTFOLIO_CHARS])
-    if symbol:
+    for symbol in symbols:
         try:
             signals = quant_models.get_quant_signals(symbol)
             if "error" not in signals:
@@ -84,7 +125,9 @@ def chat(messages: list, portfolio: dict | None = None, symbol: str | None = Non
         return {"error": "The assistant isn't configured yet."}
 
     try:
-        context = _build_context(portfolio or {}, symbol)
+        last_text = (messages[-1].get("content") or "")[:_MAX_MESSAGE_CHARS] if messages else ""
+        symbols = list(dict.fromkeys([symbol, *_mentioned(last_text)] if symbol else _mentioned(last_text)))
+        context = _build_context(portfolio or {}, symbols)
 
         # Gemini uses 'model' for assistant turns
         history = []

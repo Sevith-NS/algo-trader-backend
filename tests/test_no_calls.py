@@ -72,12 +72,16 @@ def test_ask_polaris_runs_on_the_gateway_with_its_rules_and_live_context(monkeyp
     sent = []
     monkeypatch.setattr(ai_assistant.llm_router, "PRIMARY", True)
     monkeypatch.setattr(ai_assistant.llm_router, "call_chat", lambda turns: sent.append(turns) or "Margins held.")
-    monkeypatch.setattr(ai_assistant, "_build_context", lambda portfolio, symbol: "QUANT READINGS FOR ZZ: {}")
+    monkeypatch.setattr(ai_assistant, "_mentioned", lambda text: ["ZZ", "YY"])
+    contexts = []
+    monkeypatch.setattr(ai_assistant, "_build_context",
+                        lambda portfolio, symbols: contexts.append(symbols) or "QUANT READINGS FOR ZZ: {}")
 
     reply = ai_assistant.chat([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"},
                                {"role": "user", "content": "How is ZZ doing?"}], symbol="ZZ")
 
     turns = sent[0]
+    assert contexts == [["ZZ", "YY"]]  # the open symbol plus the one named in the question, once each
     assert reply == {"reply": "Margins held."}
     assert turns[0] == {"role": "system", "content": ai_assistant.SYSTEM_PROMPT}
     assert [t["role"] for t in turns[1:]] == ["user", "assistant", "user"]
