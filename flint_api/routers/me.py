@@ -93,6 +93,8 @@ def export(user: Principal = Depends(limit("expensive"))):
             # Nothing from brokers: connections live only in the user's browser.
             "alerts": conn.execute("select * from alerts order by created_at").fetchall(),
             "alert_firings": conn.execute("select * from alert_firings order by fired_at").fetchall(),
+            "chat_threads": conn.execute("select * from chat_threads order by created_at").fetchall(),
+            "chat_messages": conn.execute("select * from chat_messages order by created_at").fetchall(),
         }
     import json
     body = json.loads(json.dumps(data, default=str))
