@@ -260,6 +260,20 @@ def test_new_routes_require_auth(client):
         assert client.post(path, json={}).status_code == 401, path
 
 
+def test_a_chat_title_is_short_plain_text(monkeypatch):
+    import ai_assistant
+    monkeypatch.setattr(ai_assistant.llm_router, "PRIMARY", True)
+    monkeypatch.setattr(ai_assistant.llm_router, "call_json", lambda p: {"title": '  "Portfolio   risk check."  '})
+    assert ai_assistant.title_for("How risky is my portfolio?", "Moderate.") == "Portfolio risk check"
+    monkeypatch.setattr(ai_assistant.llm_router, "call_json", lambda p: {"title": "x" * 200})
+    assert len(ai_assistant.title_for("q", "r")) == 80
+
+    def down(p):
+        raise ai_assistant.llm_router.RouterUnavailable("down")
+    monkeypatch.setattr(ai_assistant.llm_router, "call_json", down)
+    assert ai_assistant.title_for("q", "r") is None
+
+
 def test_a_chat_reply_survives_a_history_store_that_is_down(client, monkeypatch):
     import ai_assistant
     from flint_api.routers import chats
@@ -551,6 +565,8 @@ def test_chat_history_is_kept_per_user_and_can_be_deleted(client, users, monkeyp
     import ai_assistant
     replies = iter(["First answer.", "Second answer."])
     monkeypatch.setattr(ai_assistant, "chat", lambda messages, portfolio=None, symbol=None: {"reply": next(replies)})
+    named = []
+    monkeypatch.setattr(ai_assistant, "title_for", lambda q, r: named.append(q) or "Portfolio risk check")
     a, b = users
     ask = [{"role": "user", "content": "How risky is   my portfolio?"}]
 
@@ -561,9 +577,12 @@ def test_chat_history_is_kept_per_user_and_can_be_deleted(client, users, monkeyp
     assert client.post("/api/ai-chat", headers=auth(a),
                        json={"messages": follow, "thread_id": thread}).json()["thread_id"] == thread
 
+    # Named once, after the first answer; the follow-up keeps the name.
     listed = client.get("/api/chats", headers=auth(a)).json()["chats"]
+    assert named == ["How risky is   my portfolio?"]
     assert [(c["id"], c["title"], c["symbol"], c["messages"]) for c in listed] == \
-        [(thread, "How risky is my portfolio?", "AAPL", 4)]
+        [(thread, "Portfolio risk check", "AAPL", 4)]
+    assert listed[0]["created_at"] <= listed[0]["updated_at"]
     opened = client.get(f"/api/chats/{thread}", headers=auth(a)).json()
     assert [(m["role"], m["content"]) for m in opened["messages"]] == [
         ("user", "How risky is   my portfolio?"), ("assistant", "First answer."),

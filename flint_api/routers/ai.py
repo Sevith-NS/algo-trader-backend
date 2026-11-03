@@ -3,7 +3,7 @@ import logging
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel, Field, field_validator
 
 import agents_desk
@@ -57,7 +57,7 @@ class DeskBody(BaseModel):
 
 
 @router.post("/ai-chat")
-def ai_chat(body: ChatBody, user: Principal = Depends(limit("expensive"))):
+def ai_chat(body: ChatBody, background: BackgroundTasks, user: Principal = Depends(limit("expensive"))):
     # Checked before the model is called, so a wrong id costs no model call.
     if body.thread_id is not None:
         chats.assert_owned(user.user_id, body.thread_id)
@@ -75,6 +75,9 @@ def ai_chat(body: ChatBody, user: Principal = Depends(limit("expensive"))):
         try:
             result["thread_id"] = chats.save_turn(user.user_id, body.thread_id, question.content,
                                                   result["reply"], body.symbol)
+            if body.thread_id is None:  # a new chat gets its short title after the reply is sent
+                background.add_task(chats.name_thread, user.user_id, result["thread_id"],
+                                    question.content, result["reply"])
         except Exception:
             logging.getLogger(__name__).exception("chat history write failed")
     return result

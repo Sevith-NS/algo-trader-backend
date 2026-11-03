@@ -4,10 +4,13 @@
 save_turn; these routes list, reopen and delete them. Row-level security
 scopes every query to the caller, so another user's chat is simply not found.
 """
+import logging
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
+
+import ai_assistant
 
 from .. import db
 from ..errors import NotFound
@@ -46,12 +49,25 @@ def save_turn(user_id: str, thread_id: UUID | None, question: str, reply: str, s
     return str(thread_id)
 
 
+def name_thread(user_id: str, thread_id: str, question: str, reply: str) -> None:
+    """Give a new chat a short title, as chat apps do, once its first answer is out.
+    Runs after the response; on any failure the first question stays the title."""
+    title = ai_assistant.title_for(question, reply)
+    if not title:
+        return
+    try:
+        with db.user_tx(user_id) as conn:
+            conn.execute("update chat_threads set title = %s where id = %s", (title, thread_id))
+    except Exception:
+        logging.getLogger(__name__).exception("chat title write failed")
+
+
 @router.get("")
 def list_chats(user: Principal = Depends(limit("standard")),
                limit_: Annotated[int, Query(alias="limit", ge=1, le=100)] = 30):
     with db.user_tx(user.user_id) as conn:
         rows = conn.execute(
-            "select t.id, t.title, t.symbol, t.updated_at, count(m.id) as messages from chat_threads t "
+            "select t.id, t.title, t.symbol, t.created_at, t.updated_at, count(m.id) as messages from chat_threads t "
             "left join chat_messages m on m.thread_id = t.id "
             "group by t.id order by t.updated_at desc limit %s", (limit_,)).fetchall()
     return {"chats": [{**r, "id": str(r["id"])} for r in rows]}
@@ -60,7 +76,7 @@ def list_chats(user: Principal = Depends(limit("standard")),
 @router.get("/{thread_id}")
 def get_chat(thread_id: UUID, user: Principal = Depends(limit("standard"))):
     with db.user_tx(user.user_id) as conn:
-        thread = conn.execute("select id, title, symbol, updated_at from chat_threads where id = %s",
+        thread = conn.execute("select id, title, symbol, created_at, updated_at from chat_threads where id = %s",
                               (thread_id,)).fetchone()
         if thread is None:
             raise NotFound("Chat not found.")

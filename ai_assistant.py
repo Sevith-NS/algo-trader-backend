@@ -89,6 +89,29 @@ def _mentioned(text: str) -> list:
         return []
 
 
+def title_for(question: str, reply: str) -> str | None:
+    """Three to six words naming a chat, the way chat apps title a conversation.
+    Model output is untrusted: whitespace collapsed, quotes and end punctuation
+    stripped, cut to 80 characters. None when no model answers."""
+    prompt = ('Name this conversation in 3 to 6 words, like a chat app\'s sidebar title. Plain words, '
+              'sentence case, no quotes, no ending punctuation; keep any ticker as written. '
+              'Respond as JSON: {"title": "..."}\n\n'
+              f'QUESTION:\n{question[:600]}\n\nANSWER:\n{reply[:600]}')
+    try:
+        if llm_router.PRIMARY:
+            raw = llm_router.call_json(prompt)
+        elif _client:
+            raw = json.loads(_client.models.generate_content(
+                model=MODEL, contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json")).text)
+        else:
+            return None
+        title = " ".join(str(raw.get("title") or "").split()).strip(" .!?:;\"'")
+        return title[:80] or None
+    except Exception:
+        return None
+
+
 def _build_context(portfolio: dict, symbols: list) -> str:
     parts = []
     if portfolio:
