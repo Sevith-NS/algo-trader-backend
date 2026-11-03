@@ -978,7 +978,7 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
             for round_no in range(1, rounds + 1):
                 for side in ("BULL", "BEAR"):
                     yield {"type": "status", "stage": "debate",
-                           "message": f"Round {round_no} of {rounds}: {_SIDES[side]['name']}."}
+                           "message": f"{_SIDES[side]['name']} is writing."}
                     turn = _run_debater(side, round_no, rounds, ctx, reports, data,
                                         last["BEAR" if side == "BULL" else "BULL"])
                     turns.append(turn)
