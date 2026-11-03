@@ -45,7 +45,6 @@ class ChatBody(BaseModel):
 
 class DeskBody(BaseModel):
     symbol: Symbol
-    rounds: Annotated[int, Field(ge=1, le=agents_desk.MAX_ROUNDS)] = agents_desk.DEFAULT_ROUNDS
     portfolio: dict | None = None
     stream: bool = True
 
@@ -74,9 +73,9 @@ def agents_run(body: DeskBody, user: Principal = Depends(limit("agents"))):
     risk_pct = float(row["risk_per_trade_pct"]) if row and row["risk_per_trade_pct"] is not None else None
     runs = DbResearchRuns()
     if not body.stream:
-        return agents_desk.run_desk_sync(body.symbol, portfolio=body.portfolio, rounds=body.rounds,
+        return agents_desk.run_desk_sync(body.symbol, portfolio=body.portfolio,
                                          store=store, risk_pct=risk_pct, runs=runs)
-    return sse(agents_desk.run_desk(body.symbol, portfolio=body.portfolio, rounds=body.rounds,
+    return sse(agents_desk.run_desk(body.symbol, portfolio=body.portfolio,
                                     store=store, risk_pct=risk_pct, runs=runs))
 
 

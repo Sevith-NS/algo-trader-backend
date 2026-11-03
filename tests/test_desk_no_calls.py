@@ -34,7 +34,7 @@ def _fake_call(prompt, model):
         return {**smuggled, "summary": "Margins held.", "what_to_watch": ["Q3 results"],
                 "plan_explained": "Stop is 1.0x ATR below entry."}
     if "structured debate" in prompt:
-        return {**smuggled, "argument": "Revenue grew 12%.", "evidence": "12%"}
+        return {**smuggled, "argument": "Revenue grew 12%.", "evidence": "12%", "rebuts": "Revenue grew 12%."}
     return {**smuggled, "report": "Healthy.", "score": 0.4, "confidence": 0.8, "key_points": ["ROE 18%"]}
 
 
@@ -94,6 +94,14 @@ def test_no_event_or_note_carries_a_call(monkeypatch):
             assert "stance" not in e, e["type"]
     assert not _BANNED & set(_keys(store.saved[0]))
     assert store.saved[0]["summary"] == "Margins held."
+
+
+def test_the_debate_is_one_exchange_where_caution_answers_strength(monkeypatch):
+    events, _ = _run(monkeypatch, None, None)
+    turns = [e for e in events if e["type"] == "debate"]
+    assert [t["side"] for t in turns] == ["BULL", "BEAR"]
+    # The opener has nothing to answer, so a "rebuts" from the model is dropped.
+    assert turns[0]["rebuts"] is None and turns[1]["rebuts"] == "Revenue grew 12%."
 
 
 def test_rules_are_arithmetic_on_the_users_risk(monkeypatch):

@@ -15,10 +15,9 @@ no agent outputs buy/sell/hold, a rating, a conviction, a target or a size
        news          <- news_intel.get_news_intel
        sentiment     <- volume/flow, vol regime, fear-greed, headline spread
 
-  2. DEBATE (sequential) — the case for strength and the case for caution,
-     over N rounds. From round 2 each side must answer a specific claim the
-     other made. Both argue about what the data shows, never about what the
-     reader should do.
+  2. DEBATE (sequential) — one exchange: the case for strength opens, then
+     the case for caution must answer a specific claim it made. Both argue
+     about what the data shows, never about what the reader should do.
 
   3. SUMMARY — a balanced write-up: no winner, no stance. Where the cases
      disagree and what would settle it, what to watch, and a plain-English
@@ -67,8 +66,10 @@ _GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 _QUICK_MODEL = os.environ.get("FLINT_AGENTS_QUICK_MODEL", "gemini-3.6-flash")
 _DEEP_MODEL = os.environ.get("FLINT_AGENTS_DEEP_MODEL", "gemini-3.6-flash")
 
-DEFAULT_ROUNDS = 2
-MAX_ROUNDS = 4
+# One exchange. Every extra round re-read the same data, so it restated the
+# first one (owner, 2026-11-03) and cost two more model calls.
+DEFAULT_ROUNDS = 1
+MAX_ROUNDS = 1
 
 
 
@@ -122,7 +123,7 @@ def _friendly_error(exc) -> str:
                 "answer either, so this seat could not file.")
     if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
         return ("Gemini rate limit reached, so this seat could not file. "
-                "Run fewer debate rounds or wait a minute.")
+                "Wait a minute and run it again.")
     if any(m in msg for m in ("UNAVAILABLE", "503", "DEADLINE_EXCEEDED", "504")):
         return "Gemini was briefly unavailable, so this seat could not file."
     if isinstance(exc, (json.JSONDecodeError, ValueError)):
@@ -624,7 +625,7 @@ Respond as JSON with exactly these keys:
 {{
   "argument": "your 3-5 sentence argument",
   "evidence": "the single strongest figure from DATA you are standing on",
-  "rebuts": "the specific opposing claim you are answering, or null in round 1",
+  "rebuts": "the specific opposing claim you are answering, or null if you are opening",
   "concedes": "the one point you have to grant them, or null"
 }}
 
@@ -676,7 +677,8 @@ def _run_debater(side: str, round_no: int, total_rounds: int, ctx: dict,
                  reports: str, data: str, last_opposing: dict | None) -> dict:
     spec = _SIDES[side]
     other = _SIDES["BEAR" if side == "BULL" else "BULL"]["name"]
-    if last_opposing and last_opposing.get("argument"):
+    answering = bool(last_opposing and last_opposing.get("argument"))
+    if answering:
         opponent_block = (f"THE {other.upper()} JUST ARGUED:\n"
                           f"\"{last_opposing['argument']}\"\n"
                           f"Their stated evidence: {last_opposing.get('evidence') or 'none given'}")
@@ -697,7 +699,7 @@ def _run_debater(side: str, round_no: int, total_rounds: int, ctx: dict,
         turn.update({
             "argument": _text(raw.get("argument"), 1200),
             "evidence": _opt_text(raw.get("evidence"), 240),
-            "rebuts": _opt_text(raw.get("rebuts"), 320) if round_no > 1 else None,
+            "rebuts": _opt_text(raw.get("rebuts"), 320) if answering else None,
             "concedes": _opt_text(raw.get("concedes"), 320),
         })
     except Exception as exc:
