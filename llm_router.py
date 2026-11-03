@@ -20,6 +20,9 @@ STRICT FALLBACK, on purpose:
   - If OmniRoute is not installed or not running, every function here degrades
     to "unavailable" and the caller behaves exactly as it did before.
 
+OMNIROUTE_PRIMARY=1 flips the order for any OpenAI-compatible server, such as a
+local Ollama model: every call goes there first and Gemini becomes the fallback.
+
 Availability is probed lazily and cached, so an absent gateway costs one failed
 connection per minute rather than one per model call.
 """
@@ -41,6 +44,10 @@ API_KEY = os.environ.get("OMNIROUTE_API_KEY", "")
 MODEL = os.environ.get("OMNIROUTE_MODEL", "auto")
 # Hard off-switch. Absent or "1" leaves the fallback armed but dormant.
 ENABLED = os.environ.get("OMNIROUTE_ENABLED", "1") != "0"
+PRIMARY = ENABLED and os.environ.get("OMNIROUTE_PRIMARY", "0") == "1"
+# Sent only when set: "none" turns thinking off on Ollama's thinking models,
+# which the desk's short JSON answers do not need. Other gateways may reject it.
+REASONING_EFFORT = os.environ.get("OMNIROUTE_REASONING_EFFORT", "")
 
 REQUEST_TIMEOUT = float(os.environ.get("OMNIROUTE_TIMEOUT", "180"))
 
@@ -229,6 +236,15 @@ def call_json(prompt: str, model: str | None = None, timeout: float | None = Non
     can fall back to their existing behaviour. Raises FallbackFailed when the
     gateway answered but could not deliver, after exhausting its own retries.
     """
+    return _complete([{"role": "user", "content": prompt}], True, model, timeout)
+
+
+def call_chat(messages: list, model: str | None = None, timeout: float | None = None) -> str:
+    """One plain-text turn over a system/user/assistant history. Same errors as call_json."""
+    return _complete(messages, False, model, timeout)
+
+
+def _complete(messages: list, json_mode: bool, model: str | None, timeout: float | None):
     if not ENABLED:
         raise RouterUnavailable("OmniRoute fallback is disabled (OMNIROUTE_ENABLED=0).")
     if not is_available():
@@ -237,13 +253,16 @@ def call_json(prompt: str, model: str | None = None, timeout: float | None = Non
 
     payload = {
         "model": model or MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
+        "messages": messages,
         # OmniRoute streams by default even when the client did not ask, which
         # yields SSE frames where an OpenAI client expects one JSON object.
         # The desk wants a whole answer per seat, so opt out explicitly.
         "stream": False,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    if REASONING_EFFORT:
+        payload["reasoning_effort"] = REASONING_EFFORT
     delay = _CALL_BACKOFF
     last = "unknown error"
     for attempt in range(_CALL_ATTEMPTS):
@@ -274,8 +293,8 @@ def call_json(prompt: str, model: str | None = None, timeout: float | None = Non
             content = (choices[0].get("message") or {}).get("content")
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("empty message content")
-            parsed = json.loads(_strip_fence(content))
-            if not isinstance(parsed, dict):
+            parsed = json.loads(_strip_fence(content)) if json_mode else content.strip()
+            if json_mode and not isinstance(parsed, dict):
                 raise ValueError("non-object JSON payload")
         except (ValueError, json.JSONDecodeError) as exc:
             # A different upstream on the next attempt may well format correctly.
@@ -299,6 +318,7 @@ def status() -> dict:
     """Diagnostic snapshot for the /api/agents/routing route."""
     return {
         "enabled": ENABLED,
+        "primary": PRIMARY,
         "base_url": BASE_URL,
         "model": MODEL,
         "has_key": bool(API_KEY),

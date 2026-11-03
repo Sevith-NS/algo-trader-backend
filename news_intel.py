@@ -19,6 +19,7 @@ Where news_engine.py answers "what's the market mood?", this module answers
     - Stance = bullish / bearish / neutral + a 0-100 rating and a confidence
       level derived from article count, source diversity and score agreement.
 """
+import html
 import math
 import re
 import time
@@ -63,6 +64,17 @@ def _google_rss(query: str, indian: bool) -> str:
     return f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&{region}"
 
 
+def _snippet(entry, title: str) -> str | None:
+    """The feed's own text under a headline, as plain prose (Bing and Yahoo
+    carry a real lead). Google News only repeats the title there, so a snippet
+    that starts with the headline is dropped."""
+    text = html.unescape(re.sub(r"<[^>]+>", " ", entry.get("summary") or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or text.startswith(title[:40]):
+        return None
+    return text[:300].rsplit(" ", 1)[0] + "…" if len(text) > 300 else text
+
+
 def _fetch_feed(url: str, source_tag: str, max_items: int = 15) -> list:
     try:
         resp = data_source.http_get(url, timeout=12)
@@ -89,6 +101,7 @@ def _fetch_feed(url: str, source_tag: str, max_items: int = 15) -> list:
             "source": outlet or source_tag,
             "feed": source_tag,
             "published_dt": published,
+            "summary": _snippet(entry, title),
         })
     return items
 
@@ -156,6 +169,7 @@ def get_news_intel(symbol: str, max_total: int = 30) -> dict:
         weight = math.exp(-age_days / 3.0)  # 3-day decay
         scored.append({
             "title": a["title"],
+            "summary": a.get("summary"),
             "link": a["link"],
             "source": a["source"],
             "feed": a["feed"],

@@ -209,6 +209,27 @@ _STATIC_UNIVERSES = {
             "^N225": "Nikkei 225", "^HSI": "Hang Seng", "^AXJO": "ASX 200",
         },
     },
+    "bonds": {
+        "label": "Bond ETFs",
+        "group": "Bonds",
+        "currency": "USD",
+        # Bond prices have no keyless feed (the Indian G-Sec series included),
+        # so listed bond ETFs stand in, all verified on Yahoo's spark endpoint.
+        "currencies": {
+            "LTGILTBEES.NS": "INR", "GILT5YBEES.NS": "INR",
+            "SETF10GILT.NS": "INR", "EBBETF0433.NS": "INR",
+        },
+        "symbols": {
+            "BIL": "US T-bills, 1 to 3 months", "SHY": "US Treasuries, 1 to 3 years",
+            "IEI": "US Treasuries, 3 to 7 years", "IEF": "US Treasuries, 7 to 10 years",
+            "TLT": "US Treasuries, 20 years and longer", "TIP": "US inflation-protected Treasuries",
+            "AGG": "US aggregate bonds", "BND": "US total bond market",
+            "LQD": "US investment-grade corporate bonds", "HYG": "US high-yield corporate bonds",
+            "MUB": "US municipal bonds", "EMB": "Emerging-market government bonds",
+            "LTGILTBEES.NS": "India gilts, 8 to 13 years", "GILT5YBEES.NS": "India 5-year benchmark G-Sec",
+            "SETF10GILT.NS": "India 10-year gilt", "EBBETF0433.NS": "Bharat Bond ETF 2033",
+        },
+    },
 }
 
 
@@ -236,7 +257,7 @@ _DYNAMIC_UNIVERSES = {
 _DYNAMIC_ORDER = list(_DYNAMIC_UNIVERSES)
 
 # Group display order in the picker.
-GROUP_ORDER = ["US", "India", "Global", "Crypto", "Commodities"]
+GROUP_ORDER = ["US", "India", "Global", "Bonds", "Crypto", "Commodities"]
 
 _dynamic_cache: dict = {}
 _dynamic_lock = threading.Lock()
@@ -453,11 +474,35 @@ def _metrics_for(closes: pd.Series, periods_per_year: int = 252) -> dict | None:
 
     sma20, sma50, sma200 = sma(20), sma(50), sma(200)
 
-    rsi = None
+    rsi = rsi_prev = None
     if n >= 15:
-        v = quant_models._rsi(closes).iloc[-1]
-        if pd.notna(v):
-            rsi = float(v)
+        rsi_series = quant_models._rsi(closes)
+        if pd.notna(rsi_series.iloc[-1]):
+            rsi = float(rsi_series.iloc[-1])
+        if n >= 16 and pd.notna(rsi_series.iloc[-2]):
+            rsi_prev = float(rsi_series.iloc[-2])
+
+    # MACD(12, 26, 9) today and yesterday, for the cross screen. 60 bars so the
+    # slow EMA and the signal line have settled past their seed value.
+    macd = macd_sig = macd_prev = macd_sig_prev = None
+    if n >= 60:
+        line = (closes.ewm(span=12, adjust=False).mean()
+                - closes.ewm(span=26, adjust=False).mean())
+        sig = line.ewm(span=9, adjust=False).mean()
+        macd, macd_sig = float(line.iloc[-1]), float(sig.iloc[-1])
+        macd_prev, macd_sig_prev = float(line.iloc[-2]), float(sig.iloc[-2])
+
+    # Higher closes in a row, ending at the last bar (0 when it closed lower).
+    up_streak = 0
+    for i in range(n - 1, 0, -1):
+        if closes.iloc[i] <= closes.iloc[i - 1]:
+            break
+        up_streak += 1
+
+    range_30d = None  # highest close over lowest close in the last 30 bars, as %
+    if n >= 30:
+        lo30 = float(closes.iloc[-30:].min())
+        range_30d = (float(closes.iloc[-30:].max()) / lo30 - 1) * 100 if lo30 else None
 
     std20 = float(closes.iloc[-20:].std()) if n >= 20 else None
     zscore = pct_b = None
@@ -515,6 +560,12 @@ def _metrics_for(closes: pd.Series, periods_per_year: int = 252) -> dict | None:
         "sma50_prev5": sma_prev5(50),
         "sma200_prev5": sma_prev5(200),
         "rsi_14": rsi,
+        "rsi_14_prev": rsi_prev,
+        "macd": macd, "macd_signal": macd_sig,
+        "macd_prev": macd_prev, "macd_signal_prev": macd_sig_prev,
+        "up_streak": up_streak,
+        "price_prev5": float(closes.iloc[-6]) if n >= 6 else None,
+        "range_30d_pct": range_30d,
         "zscore_20d": zscore,
         "pct_b": pct_b,
         "vol_ann_pct": vol_ann,
@@ -672,13 +723,28 @@ _SCREENS = [
         "conditions": [
             _Cond("New 20d closing high", lambda m: m["new_20d_high"] is True),
             _Cond("Close > SMA20 > SMA50", lambda m: m["price"] > m["sma20"] > m["sma50"]),
-            _Cond("RSI(14) 55–80", lambda m: 55 <= m["rsi_14"] <= 80),
+            _Cond("RSI(14) 55 to 80", lambda m: 55 <= m["rsi_14"] <= 80),
         ],
         "confirm": [
             _Cond("RVOL ≥ 1.25", lambda c: c["rvol"] >= 1.25),
         ],
         "columns": [("rsi_14", "RSI(14)"), ("rvol", "RVOL"),
                     ("dist_sma20_pct", "vs SMA20 %")],
+    },
+    {
+        # chartink "Potential breakouts"
+        "id": "potential_breakout", "name": "Potential Breakouts",
+        "category": "Breakout", "direction": "long", "horizon": "swing",
+        "description": "Within 5% of the 52-week high after a quiet month, on volume above normal.",
+        "conditions": [
+            _Cond("Close ≥ 95% of 52-week high", lambda m: m["dist_52w_high_pct"] >= -5.0),
+            _Cond("30-day closing range ≤ 12%", lambda m: m["range_30d_pct"] <= 12),
+        ],
+        "confirm": [
+            _Cond("RVOL ≥ 1.0", lambda c: c["rvol"] >= 1.0),
+        ],
+        "columns": [("dist_52w_high_pct", "vs 52w High %"), ("range_30d_pct", "30d Range %"),
+                    ("rvol", "RVOL")],
     },
     {
         "id": "near_52w_high", "name": "52-Week High Break",
@@ -694,7 +760,7 @@ _SCREENS = [
     {
         "id": "golden_cross", "name": "Golden Cross (fresh)",
         "category": "Trend", "direction": "long", "horizon": "long_term",
-        "description": "The 50-day average just crossed above the 200-day — the classic trend-start signal.",
+        "description": "The 50-day average just crossed above the 200-day, the classic sign a trend is starting.",
         "conditions": [
             _Cond("SMA50 crossed above SMA200 within 5 bars",
                   lambda m: m["sma50"] > m["sma200"] and m["sma50_prev5"] <= m["sma200_prev5"]),
@@ -702,6 +768,31 @@ _SCREENS = [
         ],
         "confirm": [],
         "columns": [("sma50", "SMA50"), ("sma200", "SMA200")],
+    },
+    {
+        # chartink "Moving Average Crossover (Bullish)" / "4 moving average crossover"
+        "id": "sma20_cross_50", "name": "20-Day Crosses Above 50-Day",
+        "category": "Trend", "direction": "long", "horizon": "swing",
+        "description": "The 20-day average just crossed above the 50-day, an early sign of a new uptrend.",
+        "conditions": [
+            _Cond("SMA20 crossed above SMA50 within 5 bars",
+                  lambda m: m["sma20"] > m["sma50"] and m["sma20_prev5"] <= m["sma50_prev5"]),
+            _Cond("Close > SMA20", lambda m: m["price"] > m["sma20"]),
+        ],
+        "confirm": [],
+        "columns": [("sma20", "SMA20"), ("sma50", "SMA50")],
+    },
+    {
+        # chartink "Stocks above 200 EMA" / "200 SMA crossover"
+        "id": "cross_above_200", "name": "Crossed Above the 200-Day",
+        "category": "Trend", "direction": "long", "horizon": "long_term",
+        "description": "Closed above the 200-day average after sitting below it five sessions ago.",
+        "conditions": [
+            _Cond("Close > SMA200", lambda m: m["price"] > m["sma200"]),
+            _Cond("Close ≤ SMA200 five bars ago", lambda m: m["price_prev5"] <= m["sma200_prev5"]),
+        ],
+        "confirm": [],
+        "columns": [("dist_sma200_pct", "vs SMA200 %"), ("rsi_14", "RSI(14)")],
     },
     {
         "id": "uptrend_pullback", "name": "Pullback to the Moving Averages",
@@ -713,7 +804,7 @@ _SCREENS = [
             _Cond("Within 2% of SMA20 or SMA50",
                   lambda m: ((m["dist_sma20_pct"] is not None and abs(m["dist_sma20_pct"]) <= 2)
                              or (m["dist_sma50_pct"] is not None and abs(m["dist_sma50_pct"]) <= 2))),
-            _Cond("RSI(14) 35–55", lambda m: 35 <= m["rsi_14"] <= 55),
+            _Cond("RSI(14) 35 to 55", lambda m: 35 <= m["rsi_14"] <= 55),
         ],
         "confirm": [],
         # Both branches of the OR publish their value — a row matching via
@@ -732,6 +823,17 @@ _SCREENS = [
         "confirm": [],
         "columns": [("rsi_14", "RSI(14)"), ("dist_sma200_pct", "vs SMA200 %"),
                     ("ret_5d_pct", "5D %")],
+    },
+    {
+        # chartink "Daily RSI Oversold/Overbought scan", the oversold half
+        "id": "rsi_cross_30", "name": "RSI Back Above 30",
+        "category": "Mean Reversion", "direction": "long", "horizon": "swing",
+        "description": "RSI just climbed back above 30 after being oversold.",
+        "conditions": [
+            _Cond("RSI(14) crossed above 30 today", lambda m: m["rsi_14_prev"] < 30 <= m["rsi_14"]),
+        ],
+        "confirm": [],
+        "columns": [("rsi_14", "RSI(14)"), ("rsi_14_prev", "RSI yesterday")],
     },
     {
         "id": "deep_reversion", "name": "Statistical Dip",
@@ -756,10 +858,33 @@ _SCREENS = [
             # also have actually gone up.
             _Cond("60d return in top decile of universe (and positive)",
                   lambda m: m["ret60_top_decile"] and m["ret_60d_pct"] > 0),
-            _Cond("RSI(14) 55–78", lambda m: 55 <= m["rsi_14"] <= 78),
+            _Cond("RSI(14) 55 to 78", lambda m: 55 <= m["rsi_14"] <= 78),
         ],
         "confirm": [],
         "columns": [("ret_60d_pct", "60D %"), ("rsi_14", "RSI(14)")],
+    },
+    {
+        # chartink "Strong stocks"
+        "id": "up_streak_5", "name": "5 Up Days in a Row",
+        "category": "Momentum", "direction": "long", "horizon": "short_term",
+        "description": "Closed higher than the day before for at least five sessions running.",
+        "conditions": [
+            _Cond("Higher close 5 or more days in a row", lambda m: m["up_streak"] >= 5),
+        ],
+        "confirm": [],
+        "columns": [("up_streak", "Up Days"), ("ret_5d_pct", "5D %")],
+    },
+    {
+        # chartink "MACD and EMA 12,26 crossover"
+        "id": "macd_bull_cross", "name": "MACD Bullish Cross",
+        "category": "Momentum", "direction": "long", "horizon": "swing",
+        "description": "The MACD line just crossed above its signal line.",
+        "conditions": [
+            _Cond("MACD(12,26,9) crossed above its signal today",
+                  lambda m: m["macd"] > m["macd_signal"] and m["macd_prev"] <= m["macd_signal_prev"]),
+        ],
+        "confirm": [],
+        "columns": [("macd", "MACD"), ("macd_signal", "Signal")],
     },
     {
         "id": "short_term_surge", "name": "5-Day Surge",
@@ -802,7 +927,7 @@ _SCREENS = [
     {
         "id": "overbought_extension", "name": "Overbought Extension",
         "category": "Short-Side", "direction": "short", "horizon": "short_term",
-        "description": "Stretched names — RSI above 78 or price 10%+ above the 20-day average.",
+        "description": "Stretched names with RSI above 78 or price 10% or more above the 20-day average.",
         "conditions": [
             _Cond("RSI(14) > 78 or Close ≥ 10% above SMA20",
                   lambda m: ((m["rsi_14"] is not None and m["rsi_14"] > 78)
@@ -823,6 +948,28 @@ _SCREENS = [
         "confirm": [],
         "columns": [("rsi_14", "RSI(14)"), ("dist_20d_low_pct", "vs 20d Low %"),
                     ("dist_sma50_pct", "vs SMA50 %")],
+    },
+    {
+        # chartink "Daily RSI Oversold/Overbought scan", the overbought half
+        "id": "rsi_cross_70", "name": "RSI Drops Below 70",
+        "category": "Short-Side", "direction": "short", "horizon": "short_term",
+        "description": "RSI just fell back below 70 after being overbought.",
+        "conditions": [
+            _Cond("RSI(14) crossed below 70 today", lambda m: m["rsi_14_prev"] > 70 >= m["rsi_14"]),
+        ],
+        "confirm": [],
+        "columns": [("rsi_14", "RSI(14)"), ("rsi_14_prev", "RSI yesterday")],
+    },
+    {
+        # chartink "52 WEEK LOW"
+        "id": "new_52w_low", "name": "New 52-Week Low",
+        "category": "Short-Side", "direction": "short", "horizon": "swing",
+        "description": "Closed at the lowest close of the past year.",
+        "conditions": [
+            _Cond("Close is the lowest close of the past 52 weeks", lambda m: m["dist_52w_low_pct"] <= 0),
+        ],
+        "confirm": [],
+        "columns": [("dist_52w_high_pct", "vs 52w High %"), ("rsi_14", "RSI(14)")],
     },
 ]
 
@@ -942,6 +1089,9 @@ def _freshness(as_of: str) -> dict:
 _VALUE_DP = {
     "rsi_14": 1, "ret_60d_pct": 1, "dist_52w_high_pct": 1, "ext_sma20_pct": 1,
     "vol_contraction_pct": 0, "days_since_52w_high": 0,
+    "rsi_14_prev": 1, "range_30d_pct": 1, "up_streak": 0,
+    # MACD is in price units, so a sub-dollar coin needs the extra places.
+    "macd": 4, "macd_signal": 4,
 }
 
 

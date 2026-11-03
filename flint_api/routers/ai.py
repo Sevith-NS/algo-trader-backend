@@ -1,7 +1,9 @@
 """AI assistant chat and the multi-agent trading desk."""
+import logging
 from typing import Annotated, Literal
+from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel, Field, field_validator
 
 import agents_desk
@@ -12,8 +14,9 @@ from .. import db
 from ..errors import Unavailable
 from ..ratelimit import limit
 from ..security import Principal, require_admin
-from ..stores import DbJournalStore
+from ..stores import DbJournalStore, DbResearchRuns
 from ..validators import Symbol
+from . import chats
 from ._common import sse
 
 router = APIRouter(tags=["ai"])
@@ -39,21 +42,25 @@ class ChatBody(BaseModel):
     messages: Annotated[list[ChatMessage], Field(min_length=1, max_length=40)]
     portfolio: dict | None = None
     symbol: Symbol | None = None
+    # The saved chat this turn continues; omitted, the turn starts a new one.
+    thread_id: UUID | None = None
 
     _check_portfolio = field_validator("portfolio")(_bounded_context)
 
 
 class DeskBody(BaseModel):
     symbol: Symbol
-    rounds: Annotated[int, Field(ge=1, le=agents_desk.MAX_ROUNDS)] = agents_desk.DEFAULT_ROUNDS
     portfolio: dict | None = None
     stream: bool = True
 
     _check_portfolio = field_validator("portfolio")(_bounded_context)
 
 
-@router.post("/ai-chat", dependencies=[Depends(limit("expensive"))])
-def ai_chat(body: ChatBody):
+@router.post("/ai-chat")
+def ai_chat(body: ChatBody, background: BackgroundTasks, user: Principal = Depends(limit("expensive"))):
+    # Checked before the model is called, so a wrong id costs no model call.
+    if body.thread_id is not None:
+        chats.assert_owned(user.user_id, body.thread_id)
     result = ai_assistant.chat(
         messages=[m.model_dump() for m in body.messages],
         portfolio=body.portfolio,
@@ -61,6 +68,18 @@ def ai_chat(body: ChatBody):
     )
     if "error" in result:
         raise Unavailable(result["error"])
+    # History is a convenience: a store that is down never costs the reply.
+    result["thread_id"] = str(body.thread_id) if body.thread_id else None
+    question = body.messages[-1]
+    if question.role == "user":
+        try:
+            result["thread_id"] = chats.save_turn(user.user_id, body.thread_id, question.content,
+                                                  result["reply"], body.symbol)
+            if body.thread_id is None:  # a new chat gets its short title after the reply is sent
+                background.add_task(chats.name_thread, user.user_id, result["thread_id"],
+                                    question.content, result["reply"])
+        except Exception:
+            logging.getLogger(__name__).exception("chat history write failed")
     return result
 
 
@@ -72,11 +91,12 @@ def agents_run(body: DeskBody, user: Principal = Depends(limit("agents"))):
     with db.user_tx(user.user_id) as conn:
         row = conn.execute("select risk_per_trade_pct from users").fetchone()
     risk_pct = float(row["risk_per_trade_pct"]) if row and row["risk_per_trade_pct"] is not None else None
+    runs = DbResearchRuns()
     if not body.stream:
         return agents_desk.run_desk_sync(body.symbol, portfolio=body.portfolio,
-                                         rounds=body.rounds, store=store, risk_pct=risk_pct)
+                                         store=store, risk_pct=risk_pct, runs=runs)
     return sse(agents_desk.run_desk(body.symbol, portfolio=body.portfolio,
-                                    rounds=body.rounds, store=store, risk_pct=risk_pct))
+                                    store=store, risk_pct=risk_pct, runs=runs))
 
 
 @router.get("/agents/routing")

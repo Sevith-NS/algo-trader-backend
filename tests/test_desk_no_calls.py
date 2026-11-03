@@ -1,12 +1,16 @@
 """The research desk explains and never advises (product decision 2026-10-19).
 No model is called: _call_json is replaced with a fake that answers each
 prompt, including with injected verdict fields the desk must drop."""
+import json
+
+import pytest
+
 import agents_desk
 
 _FUND = {"health": {"score": 70, "grade": "B"}, "valuation": {"premium_to_own_history_pct": 10}}
 _TECH = {"phase": "markup", "volume_read": "confirming", "price": 100.0}
 _QUANT = {"current_price": 100.0, "composite_score": 0.3, "signal": "STRONG BUY", "conviction": 0.9,
-          "position_sizing": {"recommended_fraction": 0.2}, "factors": {"rsi": 0.1},
+          "position_sizing": {"recommended_fraction": 0.2}, "factors": {"rsi": 0.1}, "indicators": {},
           "levels": {"entry": 100.0, "stop_loss": 95.0, "target_1": 110.0, "target_2": 120.0, "side": "long"}}
 _NEWS = {"company": "Test Co", "stance": "neutral", "weighted_score": 0.0, "articles": []}
 
@@ -30,20 +34,35 @@ def _fake_call(prompt, model):
         return {**smuggled, "summary": "Margins held.", "what_to_watch": ["Q3 results"],
                 "plan_explained": "Stop is 1.0x ATR below entry."}
     if "structured debate" in prompt:
-        return {**smuggled, "argument": "Revenue grew 12%.", "evidence": "12%"}
+        return {**smuggled, "argument": "Revenue grew 12%.", "evidence": "12%", "rebuts": "Revenue grew 12%."}
     return {**smuggled, "report": "Healthy.", "score": 0.4, "confidence": 0.8, "key_points": ["ROE 18%"]}
 
 
-def _run(monkeypatch, portfolio, risk_pct):
+class _Runs:
+    """research_runs in memory, every row today's. The JSON round trip stands in for jsonb."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def latest(self, kind, symbol, variant=""):
+        payload = self.rows.get((kind, symbol, variant))
+        return {"payload": payload, "day": "2026-10-28", "today": True} if payload else None
+
+    def put(self, kind, symbol, variant, payload):
+        self.rows.setdefault((kind, symbol, variant), json.loads(json.dumps(payload, default=str)))
+
+
+def _run(monkeypatch, portfolio, risk_pct, runs=None, call=_fake_call):
     monkeypatch.setattr(agents_desk, "_GEMINI_KEY", "test")
-    monkeypatch.setattr(agents_desk, "_call_json", _fake_call)
+    monkeypatch.setattr(agents_desk, "_call_json", call)
     monkeypatch.setattr(agents_desk.fundamentals, "get_fundamentals", lambda s: _FUND)
     monkeypatch.setattr(agents_desk.deep_analysis, "get_technical_structure", lambda s: _TECH)
     monkeypatch.setattr(agents_desk.quant_models, "get_quant_signals", lambda s: _QUANT)
     monkeypatch.setattr(agents_desk.news_intel, "get_news_intel", lambda s, max_total=20: _NEWS)
     monkeypatch.setattr(agents_desk.ml_models, "get_ml_insights", lambda s: {"fear_greed_index": 50})
     store = _Store()
-    events = list(agents_desk.run_desk("TEST", portfolio=portfolio, rounds=1, store=store, risk_pct=risk_pct))
+    events = list(agents_desk.run_desk("TEST", portfolio=portfolio, rounds=1, store=store,
+                                       risk_pct=risk_pct, runs=runs))
     return events, store
 
 
@@ -77,6 +96,14 @@ def test_no_event_or_note_carries_a_call(monkeypatch):
     assert store.saved[0]["summary"] == "Margins held."
 
 
+def test_the_debate_is_one_exchange_where_caution_answers_strength(monkeypatch):
+    events, _ = _run(monkeypatch, None, None)
+    turns = [e for e in events if e["type"] == "debate"]
+    assert [t["side"] for t in turns] == ["BULL", "BEAR"]
+    # The opener has nothing to answer, so a "rebuts" from the model is dropped.
+    assert turns[0]["rebuts"] is None and turns[1]["rebuts"] == "Revenue grew 12%."
+
+
 def test_rules_are_arithmetic_on_the_users_risk(monkeypatch):
     events, _ = _run(monkeypatch, {"balance": 10000, "positions": []}, 1.0)
     rules = next(e for e in events if e["type"] == "rules")
@@ -89,3 +116,85 @@ def test_rules_explain_what_is_missing(monkeypatch):
     events, _ = _run(monkeypatch, None, None)
     rules = next(e for e in events if e["type"] == "rules")
     assert rules["shares"] is None and rules["notes"]
+
+
+def _model_events(events):
+    # A live run streams cards as they land and a replay in seat order, so compare as a set.
+    return sorted(json.dumps(e, sort_keys=True) for e in events if e["type"] in ("analyst", "debate", "summary"))
+
+
+def test_a_shared_run_replays_without_the_model_and_sizes_for_each_user(monkeypatch):
+    runs = _Runs()
+    first, _ = _run(monkeypatch, {"balance": 10000, "positions": []}, 1.0, runs=runs)
+
+    def no_model(prompt, model):
+        raise AssertionError("a saved run must not call the model")
+
+    second, store = _run(monkeypatch, {"balance": 50000, "positions": []}, 2.0, runs=runs, call=no_model)
+
+    assert _model_events(second) == _model_events(first)
+    rules = next(e for e in second if e["type"] == "rules")
+    # The second user's own rule: 2% of 50,000 = 1,000 at risk, 5 per share -> 200 shares.
+    assert rules["risk_pct"] == 2.0 and rules["shares"] == 200
+    context = next(e for e in second if e["type"] == "context")
+    first_context = next(e for e in first if e["type"] == "context")
+    assert context["portfolio"]["total_equity"] == 50000 and context["as_of"] == first_context["as_of"]
+    assert len(store.saved) == 1 and second[-1]["type"] == "done"
+    assert "portfolio" not in set(_keys(runs.rows[("desk", "TEST", "1")]))  # no user data is shared
+
+
+def test_the_desk_stops_when_no_analyst_can_file(monkeypatch):
+    def down(prompt, model):
+        raise agents_desk.llm_router.RouterUnavailable("down")
+
+    runs = _Runs()
+    events, store = _run(monkeypatch, None, None, runs=runs, call=down)
+
+    kinds = [e["type"] for e in events]
+    assert kinds[-1] == "error" and kinds.count("analyst") == 4
+    assert "debate" not in kinds and "summary" not in kinds
+    assert not runs.rows and not store.saved
+
+
+def test_a_run_with_a_failed_seat_is_not_shared(monkeypatch):
+    def flaky(prompt, model):
+        if "You are the News Analyst" in prompt:
+            raise ValueError("unparseable")
+        return _fake_call(prompt, model)
+
+    runs = _Runs()
+    events, _ = _run(monkeypatch, None, None, runs=runs, call=flaky)
+
+    assert events[-1]["type"] == "done" and not runs.rows
+
+
+def test_a_quota_error_fails_the_seat_at_once(monkeypatch):
+    tries = []
+
+    class _Models:
+        def generate_content(self, **kw):
+            tries.append(kw)
+            raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    class _Client:
+        models = _Models()
+
+    def no_gateway(prompt):
+        raise agents_desk.llm_router.RouterUnavailable("absent")
+
+    router = agents_desk.llm_router
+    monkeypatch.setattr(agents_desk, "_GEMINI_KEY", "test")
+    monkeypatch.setattr(agents_desk, "_get_client", lambda: _Client())
+    monkeypatch.setattr(router, "PRIMARY", False)
+    monkeypatch.setattr(router, "call_json", no_gateway)
+    monkeypatch.setattr(agents_desk.time, "sleep", lambda s: pytest.fail("a quota error must not back off"))
+    router.clear_bench(agents_desk._ROUTE_SCOPE)
+    try:
+        with pytest.raises(RuntimeError):
+            agents_desk._call_json("prompt", "model")
+        # The next seat, inside the bench window, must not knock on Gemini again.
+        with pytest.raises(router.RouterUnavailable):
+            agents_desk._call_json("prompt", "model")
+        assert len(tries) == 1
+    finally:
+        router.clear_bench(agents_desk._ROUTE_SCOPE)

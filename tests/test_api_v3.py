@@ -254,10 +254,37 @@ def test_session_hours():
 def test_new_routes_require_auth(client):
     for path in ("/api/brokers", "/api/alerts", "/api/alerts/firings", "/api/fx?pair=USDINR",
                  "/api/markets/pulse", f"/api/accounts/{uuid.uuid4()}/holdings",
-                 f"/api/accounts/{uuid.uuid4()}/performance"):
+                 f"/api/accounts/{uuid.uuid4()}/performance", "/api/chats", f"/api/chats/{uuid.uuid4()}"):
         assert client.get(path).status_code == 401, path
-    for path in ("/api/brokers/zerodha/connect", "/api/brokers/zerodha/session", "/api/alerts"):
+    for path in ("/api/brokers/zerodha/connect", "/api/brokers/zerodha/session", "/api/alerts", "/api/ai-chat"):
         assert client.post(path, json={}).status_code == 401, path
+
+
+def test_a_chat_title_is_short_plain_text(monkeypatch):
+    import ai_assistant
+    monkeypatch.setattr(ai_assistant.llm_router, "PRIMARY", True)
+    monkeypatch.setattr(ai_assistant.llm_router, "call_json", lambda p: {"title": '  "Portfolio   risk check."  '})
+    assert ai_assistant.title_for("How risky is my portfolio?", "Moderate.") == "Portfolio risk check"
+    monkeypatch.setattr(ai_assistant.llm_router, "call_json", lambda p: {"title": "x" * 200})
+    assert len(ai_assistant.title_for("q", "r")) == 80
+
+    def down(p):
+        raise ai_assistant.llm_router.RouterUnavailable("down")
+    monkeypatch.setattr(ai_assistant.llm_router, "call_json", down)
+    assert ai_assistant.title_for("q", "r") is None
+
+
+def test_a_chat_reply_survives_a_history_store_that_is_down(client, monkeypatch):
+    import ai_assistant
+    from flint_api.routers import chats
+    monkeypatch.setattr(ai_assistant, "chat", lambda messages, portfolio=None, symbol=None: {"reply": "Margins held."})
+
+    def down(*a, **kw):
+        raise RuntimeError("no database")
+    monkeypatch.setattr(chats, "save_turn", down)
+
+    r = client.post("/api/ai-chat", headers=auth(), json={"messages": [{"role": "user", "content": "Hi"}]})
+    assert r.status_code == 200 and r.json() == {"reply": "Margins held.", "thread_id": None}
 
 
 def test_fx_route(client, monkeypatch):
@@ -531,3 +558,43 @@ def test_export_has_no_broker_data(client, users, configured, fake_kite):
     assert "alerts" in data and "alert_firings" in data
     assert not {"broker_connections", "holdings", "broker_positions", "account_snapshots"} & set(data)
     assert "AB1234" not in json.dumps(data)
+
+
+@needs_db
+def test_chat_history_is_kept_per_user_and_can_be_deleted(client, users, monkeypatch):
+    import ai_assistant
+    replies = iter(["First answer.", "Second answer."])
+    monkeypatch.setattr(ai_assistant, "chat", lambda messages, portfolio=None, symbol=None: {"reply": next(replies)})
+    named = []
+    monkeypatch.setattr(ai_assistant, "title_for", lambda q, r: named.append(q) or "Portfolio risk check")
+    a, b = users
+    ask = [{"role": "user", "content": "How risky is   my portfolio?"}]
+
+    r = client.post("/api/ai-chat", headers=auth(a), json={"messages": ask, "symbol": "aapl"})
+    assert r.status_code == 200, r.text
+    thread = r.json()["thread_id"]
+    follow = ask + [{"role": "assistant", "content": "First answer."}, {"role": "user", "content": "And now?"}]
+    assert client.post("/api/ai-chat", headers=auth(a),
+                       json={"messages": follow, "thread_id": thread}).json()["thread_id"] == thread
+
+    # Named once, after the first answer; the follow-up keeps the name.
+    listed = client.get("/api/chats", headers=auth(a)).json()["chats"]
+    assert named == ["How risky is   my portfolio?"]
+    assert [(c["id"], c["title"], c["symbol"], c["messages"]) for c in listed] == \
+        [(thread, "Portfolio risk check", "AAPL", 4)]
+    assert listed[0]["created_at"] <= listed[0]["updated_at"]
+    opened = client.get(f"/api/chats/{thread}", headers=auth(a)).json()
+    assert [(m["role"], m["content"]) for m in opened["messages"]] == [
+        ("user", "How risky is   my portfolio?"), ("assistant", "First answer."),
+        ("user", "And now?"), ("assistant", "Second answer.")]
+
+    # Another user can't see, continue or delete it (and the model is never asked).
+    assert client.get("/api/chats", headers=auth(b)).json()["chats"] == []
+    assert client.get(f"/api/chats/{thread}", headers=auth(b)).status_code == 404
+    assert client.post("/api/ai-chat", headers=auth(b),
+                       json={"messages": ask, "thread_id": thread}).status_code == 404
+    assert client.delete(f"/api/chats/{thread}", headers=auth(b)).status_code == 404
+
+    assert {"chat_threads", "chat_messages"} <= set(client.get("/api/me/export", headers=auth(a)).json())
+    assert client.delete(f"/api/chats/{thread}", headers=auth(a)).status_code == 204
+    assert client.get("/api/chats", headers=auth(a)).json()["chats"] == []

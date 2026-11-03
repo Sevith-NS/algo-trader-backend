@@ -15,10 +15,9 @@ no agent outputs buy/sell/hold, a rating, a conviction, a target or a size
        news          <- news_intel.get_news_intel
        sentiment     <- volume/flow, vol regime, fear-greed, headline spread
 
-  2. DEBATE (sequential) — the case for strength and the case for caution,
-     over N rounds. From round 2 each side must answer a specific claim the
-     other made. Both argue about what the data shows, never about what the
-     reader should do.
+  2. DEBATE (sequential) — one exchange: the case for strength opens, then
+     the case for caution must answer a specific claim it made. Both argue
+     about what the data shows, never about what the reader should do.
 
   3. SUMMARY — a balanced write-up: no winner, no stance. Where the cases
      disagree and what would settle it, what to watch, and a plain-English
@@ -67,8 +66,10 @@ _GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 _QUICK_MODEL = os.environ.get("FLINT_AGENTS_QUICK_MODEL", "gemini-3.6-flash")
 _DEEP_MODEL = os.environ.get("FLINT_AGENTS_DEEP_MODEL", "gemini-3.6-flash")
 
-DEFAULT_ROUNDS = 2
-MAX_ROUNDS = 4
+# One exchange. Every extra round re-read the same data, so it restated the
+# first one (owner, 2026-11-03) and cost two more model calls.
+DEFAULT_ROUNDS = 1
+MAX_ROUNDS = 1
 
 
 
@@ -113,6 +114,8 @@ def _friendly_error(exc) -> str:
     """Agent errors render in the UI beside an empty seat — say what happened in
     the reader's terms, not in the vendor's."""
     msg = str(exc)
+    if llm_router.PRIMARY and isinstance(exc, (llm_router.RouterUnavailable, llm_router.FallbackFailed)):
+        return "The AI model is not answering right now, so this seat could not file."
     # Check the fallback first: its errors also carry "429", and blaming Gemini
     # for a gateway failure sends the reader off to fix the wrong thing.
     if isinstance(exc, llm_router.FallbackFailed) or "OmniRoute" in msg:
@@ -120,7 +123,7 @@ def _friendly_error(exc) -> str:
                 "answer either, so this seat could not file.")
     if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
         return ("Gemini rate limit reached, so this seat could not file. "
-                "Run fewer debate rounds or wait a minute.")
+                "Wait a minute and run it again.")
     if any(m in msg for m in ("UNAVAILABLE", "503", "DEADLINE_EXCEEDED", "504")):
         return "Gemini was briefly unavailable, so this seat could not file."
     if isinstance(exc, (json.JSONDecodeError, ValueError)):
@@ -144,26 +147,24 @@ def _is_quota_error(exc) -> bool:
 def _call_json(prompt: str, model: str) -> dict:
     """One JSON-mode turn, retried on transient failures and rerouted on quota.
 
-    Gemini is always the primary. OmniRoute is engaged ONLY once Gemini has
-    reported it is out of quota, and only for as long as the bench it asked for
-    (see llm_router). When OmniRoute is not installed this behaves exactly as it
-    did before: retry with backoff, then let the seat degrade.
+    Gemini is the primary unless llm_router.PRIMARY puts the gateway (e.g. a
+    local Ollama model) first. Otherwise OmniRoute is engaged ONLY once Gemini
+    has reported it is out of quota, and only for as long as the bench it asked
+    for (see llm_router). A quota error is never retried on the same key: with
+    no fallback left the seat fails at once, and so does every later seat
+    inside the bench window.
 
     Raises after the last attempt; callers decide the fallback for their seat.
     """
-    # Another seat already hit the wall inside this window — do not spend a call
-    # rediscovering it.
-    if llm_router.primary_benched(_ROUTE_SCOPE):
+    benched = llm_router.primary_benched(_ROUTE_SCOPE)
+    if llm_router.PRIMARY or benched:
         try:
             return llm_router.call_json(prompt)
-        except llm_router.RouterUnavailable:
-            pass  # gateway absent: fall through and let Gemini answer or 429
-        except llm_router.FallbackFailed:
-            # Gateway is up but could not deliver, and it has already run its
-            # own retries. Gemini is still benched, so falling through would
-            # only buy a guaranteed 429 and a misleading error message — let
-            # the seat degrade with the truthful reason instead.
-            raise
+        except (llm_router.RouterUnavailable, llm_router.FallbackFailed):
+            # Inside the bench window Gemini can only 429 again, and without a
+            # key it cannot answer at all: fail the seat now, truthfully.
+            if benched or not _GEMINI_KEY:
+                raise
 
     from google.genai import types
     config = types.GenerateContentConfig(response_mime_type="application/json")
@@ -182,12 +183,14 @@ def _call_json(prompt: str, model: str) -> dict:
             if _is_quota_error(exc):
                 # Honour the retryDelay Gemini returned rather than guessing.
                 llm_router.bench_primary(_ROUTE_SCOPE, exc)
-                try:
-                    return llm_router.call_json(prompt)
-                except llm_router.RouterUnavailable:
-                    pass  # not installed — keep the old backoff behaviour
-                except Exception:
-                    pass  # fallback failed too; Gemini retry is still worth a shot
+                if not llm_router.PRIMARY:  # PRIMARY already tried the gateway
+                    try:
+                        return llm_router.call_json(prompt)
+                    except llm_router.RouterUnavailable:
+                        pass  # FallbackFailed propagates: it is the truthful reason
+                # The key stays out of quota for its whole retryDelay, so a
+                # backoff retry only burns minutes before the seat fails anyway.
+                raise
             if attempt == _MAX_ATTEMPTS - 1 or not _retryable(exc):
                 raise
             # Jitter so four analysts that burst together do not retry in lockstep.
@@ -622,7 +625,7 @@ Respond as JSON with exactly these keys:
 {{
   "argument": "your 3-5 sentence argument",
   "evidence": "the single strongest figure from DATA you are standing on",
-  "rebuts": "the specific opposing claim you are answering, or null in round 1",
+  "rebuts": "the specific opposing claim you are answering, or null if you are opening",
   "concedes": "the one point you have to grant them, or null"
 }}
 
@@ -674,7 +677,8 @@ def _run_debater(side: str, round_no: int, total_rounds: int, ctx: dict,
                  reports: str, data: str, last_opposing: dict | None) -> dict:
     spec = _SIDES[side]
     other = _SIDES["BEAR" if side == "BULL" else "BULL"]["name"]
-    if last_opposing and last_opposing.get("argument"):
+    answering = bool(last_opposing and last_opposing.get("argument"))
+    if answering:
         opponent_block = (f"THE {other.upper()} JUST ARGUED:\n"
                           f"\"{last_opposing['argument']}\"\n"
                           f"Their stated evidence: {last_opposing.get('evidence') or 'none given'}")
@@ -695,7 +699,7 @@ def _run_debater(side: str, round_no: int, total_rounds: int, ctx: dict,
         turn.update({
             "argument": _text(raw.get("argument"), 1200),
             "evidence": _opt_text(raw.get("evidence"), 240),
-            "rebuts": _opt_text(raw.get("rebuts"), 320) if round_no > 1 else None,
+            "rebuts": _opt_text(raw.get("rebuts"), 320) if answering else None,
             "concedes": _opt_text(raw.get("concedes"), 320),
         })
     except Exception as exc:
@@ -856,13 +860,29 @@ def _context_event(run_id: str, ctx: dict, rounds: int) -> dict:
     }
 
 
+def _saved_run(runs, symbol: str, rounds: int):
+    """Today's shared run for this symbol and round count, if there is one."""
+    if runs is None:
+        return None
+    try:
+        row = runs.latest("desk", symbol, str(rounds))
+    except Exception:  # a dead store means a fresh run, never a failed one
+        logging.getLogger(__name__).exception("shared desk run read failed")
+        return None
+    return row["payload"] if row and row["today"] else None
+
+
 def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_ROUNDS,
-             store=None, risk_pct=None):
+             store=None, risk_pct=None, runs=None):
     """Run the full desk, yielding one event dict per agent turn.
 
     The caller decides the transport: the API route wraps these as SSE frames
     so the debate lands in the UI turn by turn instead of after 40 seconds of
     blank screen, and run_desk_sync() collects them into one payload.
+
+    `runs` shares the model's part of a run (analysts, debate, summary) across
+    users for the day, since it reads only the symbol's data, never the user's.
+    The portfolio, Your rules and the journal note are always this caller's own.
     """
     started = time.time()
     run_id = uuid.uuid4().hex[:12]
@@ -872,25 +892,34 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
     if not symbol:
         yield {"type": "error", "message": "A symbol is required."}
         return
-    if not _GEMINI_KEY:
+    saved = _saved_run(runs, symbol, rounds)
+    if saved is None and not (_GEMINI_KEY or llm_router.PRIMARY):
         yield {"type": "error", "message": "The research desk needs GEMINI_API_KEY in backend/.env."}
         return
 
-    yield {"type": "status", "stage": "gather",
-           "message": f"Pulling fundamentals, structure, quant and news for {symbol}."}
-    try:
-        ctx = _gather(symbol, portfolio)
-    except Exception as exc:
-        yield {"type": "error", "message": f"Could not assemble data for {symbol}: {exc}"}
-        return
-    ctx["symbol"] = symbol
+    if saved:
+        context = {**saved["context"], "run_id": run_id}
+        # Your rules and the note need only the plan's levels and the price.
+        ctx = {"symbol": symbol, "company": context["company"], "price": context["price"],
+               "quant": context["quant"] or {"error": "unavailable"}}
+        ctx["portfolio"] = context["portfolio"] = _portfolio_context(symbol, portfolio, ctx["price"])
+    else:
+        yield {"type": "status", "stage": "gather",
+               "message": f"Pulling fundamentals, structure, quant and news for {symbol}."}
+        try:
+            ctx = _gather(symbol, portfolio)
+        except Exception as exc:
+            yield {"type": "error", "message": f"Could not assemble data for {symbol}: {exc}"}
+            return
+        ctx["symbol"] = symbol
 
-    if not any(_ok(ctx[k]) for k in ("quant", "technical", "fundamentals")):
-        yield {"type": "error",
-               "message": f"No usable market data for {symbol}. Check the ticker and try again."}
-        return
+        if not any(_ok(ctx[k]) for k in ("quant", "technical", "fundamentals")):
+            yield {"type": "error",
+                   "message": f"No usable market data for {symbol}. Check the ticker and try again."}
+            return
+        context = {**_context_event(run_id, ctx, rounds), "as_of": int(started)}
 
-    yield _context_event(run_id, ctx, rounds)
+    yield context
 
     # Routing visibility. The analysts answer on pool threads, so rather than
     # plumbing a collector through every agent signature the run snapshots
@@ -899,7 +928,8 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
 
     def _route_events():
         """A one-shot notice the first time this run leaves Gemini."""
-        if route["seen"] or llm_router.counters()["fallback_calls"] <= route["start"]:
+        if (llm_router.PRIMARY or route["seen"]
+                or llm_router.counters()["fallback_calls"] <= route["start"]):
             return []
         route["seen"] = True
         return [{
@@ -913,41 +943,63 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
         }]
 
     try:
-        # ---- 1. analyst team, in parallel; each card streams as it lands ----
-        yield {"type": "status", "stage": "analysts",
-               "message": "Four analysts reading their own slice of the data."}
-        cards = []
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(_run_analyst, spec, ctx) for spec in _ANALYSTS]
-            for fut in as_completed(futures):
-                card = fut.result()
-                cards.append(card)
+        if saved:
+            cards, turns, summary = saved["cards"], saved["turns"], saved["summary"]
+            for card in cards:
                 yield {"type": "analyst", **card}
-        yield from _route_events()
-        order = {s["key"]: i for i, s in enumerate(_ANALYSTS)}
-        cards.sort(key=lambda c: order.get(c["role"], 99))
-
-        # ---- 2. debate ----
-        reports = _reports_block(cards)
-        data = _blob(_debate_data(ctx), 12000)
-        turns = []
-        last = {"BULL": None, "BEAR": None}
-        for round_no in range(1, rounds + 1):
-            for side in ("BULL", "BEAR"):
-                yield {"type": "status", "stage": "debate",
-                       "message": f"Round {round_no} of {rounds}: {_SIDES[side]['name']}."}
-                turn = _run_debater(side, round_no, rounds, ctx, reports, data,
-                                    last["BEAR" if side == "BULL" else "BULL"])
-                turns.append(turn)
-                last[side] = turn
+            for turn in turns:
                 yield {"type": "debate", **turn}
-                yield from _route_events()
+            yield {"type": "summary", **summary}
+        else:
+            # ---- 1. analyst team, in parallel; each card streams as it lands ----
+            yield {"type": "status", "stage": "analysts",
+                   "message": "Four analysts reading their own slice of the data."}
+            cards = []
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(_run_analyst, spec, ctx) for spec in _ANALYSTS]
+                for fut in as_completed(futures):
+                    card = fut.result()
+                    cards.append(card)
+                    yield {"type": "analyst", **card}
+            yield from _route_events()
+            order = {s["key"]: i for i, s in enumerate(_ANALYSTS)}
+            cards.sort(key=lambda c: order.get(c["role"], 99))
+            # With no card filed the model is down or out of quota; a debate
+            # would only spend minutes failing the same way, seat by seat.
+            if all(c.get("error") for c in cards):
+                yield {"type": "error", "message": cards[0]["error"]}
+                return
 
-        # ---- 3. the balanced summary ----
-        yield {"type": "status", "stage": "summary", "message": "Writing the desk summary."}
-        summary = _run_summary(ctx, rounds, reports, _transcript_block(turns), data)
-        yield {"type": "summary", **summary}
-        yield from _route_events()
+            # ---- 2. debate ----
+            reports = _reports_block(cards)
+            data = _blob(_debate_data(ctx), 12000)
+            turns = []
+            last = {"BULL": None, "BEAR": None}
+            for round_no in range(1, rounds + 1):
+                for side in ("BULL", "BEAR"):
+                    yield {"type": "status", "stage": "debate",
+                           "message": f"{_SIDES[side]['name']} is writing."}
+                    turn = _run_debater(side, round_no, rounds, ctx, reports, data,
+                                        last["BEAR" if side == "BULL" else "BULL"])
+                    turns.append(turn)
+                    last[side] = turn
+                    yield {"type": "debate", **turn}
+                    yield from _route_events()
+
+            # ---- 3. the balanced summary ----
+            yield {"type": "status", "stage": "summary", "message": "Writing the desk summary."}
+            summary = _run_summary(ctx, rounds, reports, _transcript_block(turns), data)
+            yield {"type": "summary", **summary}
+            yield from _route_events()
+
+            # Only a complete run is shared, so a seat that failed gets another go.
+            if runs is not None and not any(x.get("error") for x in (*cards, *turns, summary)):
+                shared = {k: v for k, v in context.items() if k not in ("run_id", "portfolio")}
+                try:
+                    runs.put("desk", symbol, str(rounds),
+                             {"context": shared, "cards": cards, "turns": turns, "summary": summary})
+                except Exception:
+                    logging.getLogger(__name__).exception("shared desk run write failed")
 
         # ---- 4. what the user's own rules imply (arithmetic, no model) ----
         rules = _your_rules(ctx, risk_pct)
@@ -995,10 +1047,11 @@ def run_desk(symbol: str, portfolio: dict | None = None, rounds: int = DEFAULT_R
 
 
 def run_desk_sync(symbol: str, portfolio: dict | None = None,
-                  rounds: int = DEFAULT_ROUNDS, store=None, risk_pct=None) -> dict:
+                  rounds: int = DEFAULT_ROUNDS, store=None, risk_pct=None, runs=None) -> dict:
     """Collect a full run into one payload, for callers that cannot stream."""
     result = {"analysts": [], "debate": []}
-    for event in run_desk(symbol, portfolio=portfolio, rounds=rounds, store=store, risk_pct=risk_pct):
+    for event in run_desk(symbol, portfolio=portfolio, rounds=rounds, store=store,
+                          risk_pct=risk_pct, runs=runs):
         kind = event.get("type")
         if kind == "analyst":
             result["analysts"].append(event)

@@ -9,6 +9,7 @@ import news_intel
 import quant_models
 
 from ..ratelimit import limit
+from ..stores import DbResearchRuns
 from ..validators import Symbol
 from ._common import cache, unwrap
 
@@ -67,4 +68,4 @@ def ticker_news_intel(response: Response, symbol: Symbol):
 
 @router.get("/deep-analysis", dependencies=[expensive])
 def deep_analysis_route(symbol: Symbol, ai: bool = False):
-    return unwrap(deep_analysis.get_deep_analysis(symbol, include_ai=ai))
+    return unwrap(deep_analysis.get_deep_analysis(symbol, include_ai=ai, runs=DbResearchRuns()))

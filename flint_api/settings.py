@@ -64,7 +64,7 @@ def load() -> Settings:
         clerk_issuer=(os.environ.get("CLERK_ISSUER") or _issuer_from_publishable_key(pk)).rstrip("/"),
         clerk_jwt_key=os.environ.get("CLERK_JWT_KEY", "").replace("\\n", "\n"),
         clerk_secret_key=os.environ.get("CLERK_SECRET_KEY", ""),
-        authorized_parties=_csv("AUTHORIZED_PARTIES", "http://localhost:3000,http://localhost:3123"),
+        authorized_parties=tuple(o.rstrip("/") for o in _csv("AUTHORIZED_PARTIES", "http://localhost:3000,http://localhost:3123")),
         admin_user_ids=_csv("ADMIN_USER_IDS", ""),
         database_url_app=os.environ.get("DATABASE_URL_APP", ""),
         database_url_owner=os.environ.get("DATABASE_URL_UNPOOLED", ""),

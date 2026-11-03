@@ -525,6 +525,61 @@ def get_sector(symbol: str) -> str:
     return sector
 
 
+def _pct(fraction):
+    return round(fraction * 100, 2) if isinstance(fraction, (int, float)) else None
+
+
+def get_company_profile(symbol: str) -> dict | None:
+    """What the company does and its key statistics, live from yfinance
+    `.info` and `.calendar`, cached for a day. yfinance handles Yahoo's crumb,
+    which the raw quoteSummary call this replaces usually failed. Fractions
+    come back as percentages, so no reader has to guess the unit."""
+    key = f"company:{symbol}"
+    cached, fresh = _cache_get(key, 24 * 3600)
+    if cached is not None and fresh:
+        return cached
+    try:
+        ticker = yf.Ticker(symbol)
+        info = _throttled(lambda: ticker.info) or {}
+        try:
+            dates = (_throttled(lambda: ticker.calendar) or {}).get("Earnings Date") or []
+        except Exception:
+            dates = []  # a missing calendar costs the dates, not the profile
+    except Exception:
+        return cached  # stale beats nothing, and a failure is not cached
+    summary = info.get("longBusinessSummary")
+    if summary and len(summary) > 1200:
+        summary = summary[:1200].rsplit(" ", 1)[0] + "…"
+    profile = {
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
+        "business_summary": summary,
+        "full_time_employees": info.get("fullTimeEmployees"),
+        "insiders_pct": _pct(info.get("heldPercentInsiders")),
+        "institutions_pct": _pct(info.get("heldPercentInstitutions")),
+        "market_cap": info.get("marketCap"),
+        "trailing_pe": info.get("trailingPE"),
+        "forward_pe": info.get("forwardPE"),
+        "price_to_book": info.get("priceToBook"),
+        "beta": info.get("beta"),
+        "dividend_yield_pct": info.get("dividendYield"),  # yfinance already gives a percentage here
+        "revenue_growth_yoy_pct": _pct(info.get("revenueGrowth")),
+        "earnings_growth_yoy_pct": _pct(info.get("earningsGrowth")),
+        "gross_margin_pct": _pct(info.get("grossMargins")),
+        "operating_margin_pct": _pct(info.get("operatingMargins")),
+        "profit_margin_pct": _pct(info.get("profitMargins")),
+        "total_cash": info.get("totalCash"),
+        "total_debt": info.get("totalDebt"),
+        "free_cash_flow": info.get("freeCashflow"),
+        "financial_currency": info.get("financialCurrency"),
+        "next_earnings_dates": [d.isoformat() for d in dates if hasattr(d, "isoformat")] or None,
+    }
+    if all(v is None for v in profile.values()):
+        return cached
+    _cache_put(key, profile)
+    return profile
+
+
 # ------------------------------------------------------------------ quote ---
 
 def get_quote(symbol: str) -> dict:
