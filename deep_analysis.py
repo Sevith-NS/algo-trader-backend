@@ -251,7 +251,8 @@ def _narrative(symbol: str, company: str, payload: dict) -> dict | None:
             return llm_router.call_json(prompt)
         from google import genai
         from google.genai import types
-        client = genai.Client(api_key=_GEMINI_KEY)
+        # The SDK has no default timeout; one long teardown gets 120 s (in ms).
+        client = genai.Client(api_key=_GEMINI_KEY, http_options=types.HttpOptions(timeout=120_000))
         resp = client.models.generate_content(
             model=_MODEL,
             contents=prompt,

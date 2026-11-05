@@ -28,7 +28,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 _MAX_HISTORY = 20
 _MAX_MESSAGE_CHARS = 4000
 _MAX_PORTFOLIO_CHARS = 4000
-_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# google-genai has no default timeout: a hung call would hold the function until Vercel kills it.
+_client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=60_000)) if GEMINI_API_KEY else None
 
 MODEL = "gemini-3.6-flash"
 

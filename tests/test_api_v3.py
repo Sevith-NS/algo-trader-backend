@@ -526,6 +526,40 @@ def test_stale_quotes_never_fire(client, users, monkeypatch):
     assert client.get("/api/alerts/firings", headers=auth(a)).json()["firings"] == []
 
 
+def test_alerts_that_dont_fire_are_marked_in_one_statement(monkeypatch):
+    import contextlib
+    import data_source
+    from flint_api.routers import alerts
+    ids = [uuid.uuid4() for _ in range(4)]
+    active = [{"id": ids[0], "symbol": "AAPL", "kind": "price_above", "threshold": Decimal("105")},
+              {"id": ids[1], "symbol": "MSFT", "kind": "price_above", "threshold": Decimal("500")},
+              {"id": ids[2], "symbol": "TCS.NS", "kind": "price_below", "threshold": Decimal("1")},
+              {"id": ids[3], "symbol": "OLD", "kind": "price_above", "threshold": Decimal("1")}]
+    sql = []
+
+    class Conn:
+        def execute(self, query, params=()):
+            sql.append((query, params))
+            return self
+
+        def fetchall(self):
+            return active
+
+        def fetchone(self):
+            return {"id": ids[0]}
+
+    monkeypatch.setattr(db, "user_tx", lambda user_id: contextlib.nullcontext(Conn()))
+    monkeypatch.setattr(data_source, "get_quote", lambda s: {"regularMarketPrice": 400.0, "stale": s == "OLD"}
+                        if s != "AAPL" else {"regularMarketPrice": 106.0})
+    alerts.evaluate("user_t_batch", force=True)
+    updates = [(q, p) for q, p in sql if q.startswith("update")]
+    assert len(updates) == 2  # the alert that fired, then one for the rest
+    assert "triggered" in updates[0][0] and updates[0][1] == (ids[0],)
+    # A stale quote never counts as a check.
+    assert updates[1] == ("update alerts set last_checked_at = now() where id = any(%s)", ([ids[1], ids[2]],))
+    assert sum(q.startswith("insert into alert_firings") for q, _ in sql) == 1
+
+
 @needs_db
 def test_paper_performance(client, users, monkeypatch):
     import pandas as pd

@@ -110,7 +110,7 @@ The repo already contains what Vercel needs:
 | File | Purpose |
 |---|---|
 | `index.py` | Exposes `flint_api.main:app` where Vercel looks for it. |
-| `vercel.json` | Allows requests up to 300 s (the AI desk streams for a while) and keeps tests out of the bundle. |
+| `vercel.json` | Allows requests up to 300 s (the AI desk streams for a while), keeps tests out of the bundle, and runs the API in `cle1` (Cleveland, AWS us-east-2), the Neon database's region, so each query stays inside one region. If the database moves, move this too. |
 | `.vercelignore` | Keeps `.env*`, venv and caches out of CLI uploads. |
 | `.python-version` | Python 3.14. |
 | `requirements.txt` | Runtime packages only; test tools live in `requirements-dev.txt` to keep the bundle under Vercel's 500 MB limit. |
