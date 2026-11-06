@@ -617,40 +617,46 @@ def _previous_close(records: list[dict], meta: dict, price):
     return meta.get("previousClose") or meta.get("chartPreviousClose")
 
 
+def _quote_from(symbol: str, records: list[dict], meta: dict) -> dict:
+    """A quote from one symbol's chart meta and daily candles (chart or spark API)."""
+    price = meta.get("regularMarketPrice")
+    closes = [r["c"] for r in records]
+    if price is None and closes:
+        price = closes[-1]
+    prev = _previous_close(records, meta, price)
+    quote = {
+        "symbol": symbol,
+        "shortName": meta.get("shortName") or symbol,
+        "longName": meta.get("longName") or meta.get("shortName") or symbol,
+        "currency": meta.get("currency") or "USD",
+        "regularMarketPrice": price,
+        "previousClose": prev,
+        "regularMarketChangePercent": ((price - prev) / prev * 100) if price and prev else 0,
+        "regularMarketVolume": meta.get("regularMarketVolume") or (records[-1].get("v") if records else None),
+        "fiftyTwoWeekHigh": meta.get("fiftyTwoWeekHigh"),
+        "fiftyTwoWeekLow": meta.get("fiftyTwoWeekLow"),
+        "marketCap": None,
+        "regularMarketTime": meta.get("regularMarketTime"),
+    }
+    # enrich from cached yearly history if available (no extra network call)
+    hist_cached, _ = _cache_get(f"hist:{symbol}:1y", STALE_TTL)
+    if hist_cached:
+        vols = [r["v"] for r in hist_cached[-63:] if r["v"]]
+        if vols:
+            quote["averageDailyVolume3Month"] = sum(vols) / len(vols)
+        if not quote["fiftyTwoWeekHigh"]:
+            quote["fiftyTwoWeekHigh"] = max(r["h"] for r in hist_cached)
+        if not quote["fiftyTwoWeekLow"]:
+            quote["fiftyTwoWeekLow"] = min(r["l"] for r in hist_cached)
+    return quote
+
+
 def _fetch_quote(key: str, symbol: str, cached):
     """Uncached quote fetch — call only while holding the key's flight lock."""
     quote = None
     try:
         records, meta = _fetch_chart(symbol, range_="5d")
-        price = meta.get("regularMarketPrice")
-        closes = [r["c"] for r in records]
-        if price is None and closes:
-            price = closes[-1]
-        prev = _previous_close(records, meta, price)
-        quote = {
-            "symbol": symbol,
-            "shortName": meta.get("shortName") or symbol,
-            "longName": meta.get("longName") or meta.get("shortName") or symbol,
-            "currency": meta.get("currency") or "USD",
-            "regularMarketPrice": price,
-            "previousClose": prev,
-            "regularMarketChangePercent": ((price - prev) / prev * 100) if price and prev else 0,
-            "regularMarketVolume": meta.get("regularMarketVolume") or (records[-1]["v"] if records else None),
-            "fiftyTwoWeekHigh": meta.get("fiftyTwoWeekHigh"),
-            "fiftyTwoWeekLow": meta.get("fiftyTwoWeekLow"),
-            "marketCap": None,
-            "regularMarketTime": meta.get("regularMarketTime"),
-        }
-        # enrich from cached yearly history if available (no extra network call)
-        hist_cached, _ = _cache_get(f"hist:{symbol}:1y", STALE_TTL)
-        if hist_cached:
-            vols = [r["v"] for r in hist_cached[-63:] if r["v"]]
-            if vols:
-                quote["averageDailyVolume3Month"] = sum(vols) / len(vols)
-            if not quote["fiftyTwoWeekHigh"]:
-                quote["fiftyTwoWeekHigh"] = max(r["h"] for r in hist_cached)
-            if not quote["fiftyTwoWeekLow"]:
-                quote["fiftyTwoWeekLow"] = min(r["l"] for r in hist_cached)
+        quote = _quote_from(symbol, records, meta)
     except Exception:
         quote = None
 
@@ -681,9 +687,65 @@ def _fetch_quote(key: str, symbol: str, cached):
     return quote
 
 
+# ----------------------------------------------------------- batch quotes ---
+
+_SPARK_QUOTES_URL = "https://query1.finance.yahoo.com/v7/finance/spark"  # v7 keeps each symbol's chart meta
+_SPARK_MAX = 20  # Yahoo answers 400 above 20 symbols
+
+
+def get_quotes(symbols: list[str]) -> dict:
+    """Quotes plus a month of daily closes for many symbols, one throttled Yahoo
+    call per 20 uncached symbols instead of one call each (and a chart call each
+    for the closes). Same fields and previous-close rule as get_quote, whose
+    cache it fills. Returns {"quotes": {sym: quote}, "closes": {sym: [close, ...]}}."""
+    out, todo = {}, []
+    for s in symbols:
+        cached, fresh = _cache_get(f"batch:{s}", FRESH_TTL["quote"])
+        if cached is not None and fresh:
+            out[s] = cached
+        else:
+            todo.append(s)
+
+    for i in range(0, len(todo), _SPARK_MAX):
+        chunk = todo[i:i + _SPARK_MAX]
+        try:
+            data = _get_json(_SPARK_QUOTES_URL, {"symbols": ",".join(chunk), "range": "1mo", "interval": "1d"})
+            answered = True
+        except Exception:
+            data, answered = {}, False
+        for result in (data.get("spark") or {}).get("result") or []:
+            try:
+                sym = result["symbol"]
+                resp = result["response"][0]
+                closes = (resp["indicators"]["quote"][0].get("close") or [])
+                records = [{"t": pd.Timestamp(t, unit="s", tz="UTC").isoformat(), "c": float(c)}
+                           for t, c in zip(resp.get("timestamp") or [], closes) if c is not None]
+                quote = _quote_from(sym, records, resp.get("meta") or {})
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if sym not in chunk or not quote["regularMarketPrice"]:
+                continue
+            out[sym] = {"quote": quote, "closes": [r["c"] for r in records]}
+            _cache_put(f"batch:{sym}", out[sym])
+            _cache_put(f"quote:{sym}", quote)
+        for s in chunk:
+            if s in out:
+                continue
+            stale, _ = _cache_get(f"batch:{s}", FRESH_TTL["quote"])
+            if stale is not None:  # last good answer, marked so the UI shows its age
+                out[s] = {"quote": {**stale["quote"], "stale": True}, "closes": stale["closes"]}
+            elif answered:  # Yahoo answered without this one: try it on its own
+                out[s] = {"quote": get_quote(s), "closes": []}
+            else:  # Yahoo is failing: don't add one throttled call per symbol on top
+                out[s] = {"quote": {"symbol": s, "error": "Market data temporarily unavailable."}, "closes": []}
+
+    return {"quotes": {s: out[s]["quote"] for s in symbols},
+            "closes": {s: out[s]["closes"] for s in symbols}}
+
+
 # --------------------------------------------------------------- overview ---
 
-OVERVIEW_SYMBOLS = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'META', 'GOOGL',
+OVERVIEW_SYMBOLS =['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'META', 'GOOGL',
                     'JPM', 'V', 'WMT', 'JNJ', 'PG', 'XOM', 'BAC', 'MA']
 
 # Static approximate caps (USD) used only for heatmap tile sizing when live

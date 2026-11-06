@@ -92,7 +92,8 @@ def _get_client():
     with _client_lock:
         if _client is None:
             from google import genai
-            _client = genai.Client(api_key=_GEMINI_KEY)
+            # The SDK has no default timeout. 60 s (in ms) keeps 3 attempts plus backoff under Vercel's 300 s.
+            _client = genai.Client(api_key=_GEMINI_KEY, http_options={"timeout": 60_000})
     return _client
 
 

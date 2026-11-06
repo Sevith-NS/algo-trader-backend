@@ -97,6 +97,7 @@ def evaluate(user_id: str, *, force: bool = False) -> None:
         except Exception:
             quotes[symbol] = {}
 
+    checked = []
     with db.user_tx(user_id) as conn:
         for a in active:
             q = quotes[a["symbol"]]
@@ -115,7 +116,9 @@ def evaluate(user_id: str, *, force: bool = False) -> None:
                                  (a["id"], user_id, Decimal(str(price)),
                                   Decimal(str(round(change, 4))) if change is not None else None))
             else:
-                conn.execute("update alerts set last_checked_at = now() where id = %s", (a["id"],))
+                checked.append(a["id"])
+        if checked:  # one statement for every alert that didn't fire, not one each
+            conn.execute("update alerts set last_checked_at = now() where id = any(%s)", (checked,))
 
 
 @router.get("")

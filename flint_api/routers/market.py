@@ -1,4 +1,5 @@
 """Market-wide data: search, quotes, charts, overview, pulse, FX, discovery, movers."""
+import re
 from typing import Annotated, Literal
 
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ import screener_engine
 
 from ..errors import AppError, NotFound, Unavailable
 from ..ratelimit import limit
-from ..validators import RegistryId, Symbol
+from ..validators import SYMBOL_PATTERN, RegistryId, Symbol
 from ._common import cache, unwrap
 
 router = APIRouter(tags=["market"])
@@ -39,6 +40,20 @@ def search(response: Response, q: Annotated[str, Query(min_length=1, max_length=
 def quote(response: Response, symbol: Symbol):
     cache(response, 30)
     return data_source.get_quote(symbol)
+
+
+_MAX_QUOTES = 250  # our watchlists hold 100; a broker's lists can be longer
+
+
+@router.get("/quotes", dependencies=[standard])
+def quotes(response: Response, symbols: Annotated[str, Query(min_length=1, max_length=6000)]):
+    """Quotes and a month of daily closes for up to 250 symbols (comma separated),
+    one Yahoo call per 20, for watchlist rows."""
+    wanted = list(dict.fromkeys(s.strip().upper() for s in symbols.split(",") if s.strip()))
+    if not 0 < len(wanted) <= _MAX_QUOTES or not all(re.fullmatch(SYMBOL_PATTERN, s) for s in wanted):
+        raise AppError(f"Send 1 to {_MAX_QUOTES} symbols, separated by commas.")
+    cache(response, 30)
+    return data_source.get_quotes(wanted)
 
 
 @router.get("/chart", dependencies=[standard])
