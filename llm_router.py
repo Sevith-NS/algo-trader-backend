@@ -244,6 +244,68 @@ def call_chat(messages: list, model: str | None = None, timeout: float | None = 
     return _complete(messages, False, model, timeout)
 
 
+def stream_chat(messages: list, model: str | None = None, timeout: float | None = None):
+    """call_chat, yielded piece by piece as the gateway writes it.
+
+    Raises RouterUnavailable or FallbackFailed before the first piece, as
+    call_chat does, so the caller can still fall back. No retries: a half-sent
+    answer can't be taken back, so an error after the first piece ends it.
+    """
+    if not ENABLED:
+        raise RouterUnavailable("OmniRoute fallback is disabled (OMNIROUTE_ENABLED=0).")
+    if not is_available():
+        raise RouterUnavailable(
+            f"OmniRoute is not answering at {BASE_URL}. Start it with `omniroute start`.")
+    payload = {"model": model or MODEL, "messages": messages, "stream": True}
+    if REASONING_EFFORT:
+        payload["reasoning_effort"] = REASONING_EFFORT
+    try:
+        resp = requests.post(f"{BASE_URL}/chat/completions", json=payload, headers=_headers(),
+                             timeout=timeout or REQUEST_TIMEOUT, stream=True)
+    except requests.RequestException as exc:
+        with _lock:
+            _probe["ts"] = 0.0
+            _stats["fallback_failures"] += 1
+        raise RouterUnavailable(f"OmniRoute request failed: {exc}") from exc
+
+    with resp:
+        if resp.status_code >= 400 or "text/event-stream" not in resp.headers.get("content-type", ""):
+            # An error, or a gateway that ignored stream:true and sent one JSON body.
+            content = None
+            if resp.status_code < 400:
+                choices = _decode(resp).get("choices") or [{}]
+                content = (choices[0].get("message") or {}).get("content")
+            if not isinstance(content, str) or not content.strip():
+                with _lock:
+                    _stats["fallback_failures"] += 1
+                raise FallbackFailed(f"OmniRoute could not answer (HTTP {resp.status_code}: {resp.text[:160]})")
+            yield content.strip()
+            return
+        sent = False
+        for raw in resp.iter_lines():
+            line = raw.decode("utf-8", "replace").strip()  # never requests' charset guess
+            if not line.startswith("data:"):
+                continue  # blank separators and ": keep-alive" comments
+            chunk = line[5:].strip()
+            if chunk == "[DONE]":
+                break
+            try:
+                frame = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            if frame.get("error"):  # some upstreams report a failure as a data frame
+                raise FallbackFailed(f"OmniRoute stream failed: {str(frame['error'])[:160]}")
+            for choice in frame.get("choices") or []:
+                piece = (choice.get("delta") or {}).get("content")
+                if isinstance(piece, str) and piece:
+                    sent = True
+                    yield piece
+        if not sent:
+            raise FallbackFailed("OmniRoute sent an empty answer.")
+    with _lock:
+        _stats["fallback_calls"] += 1
+
+
 def _complete(messages: list, json_mode: bool, model: str | None, timeout: float | None):
     if not ENABLED:
         raise RouterUnavailable("OmniRoute fallback is disabled (OMNIROUTE_ENABLED=0).")

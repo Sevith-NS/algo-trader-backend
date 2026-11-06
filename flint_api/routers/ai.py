@@ -44,6 +44,8 @@ class ChatBody(BaseModel):
     symbol: Symbol | None = None
     # The saved chat this turn continues; omitted, the turn starts a new one.
     thread_id: UUID | None = None
+    # Server-Sent Events, the reply piece by piece; off, one JSON answer (older tabs).
+    stream: bool = False
 
     _check_portfolio = field_validator("portfolio")(_bounded_context)
 
@@ -56,11 +58,50 @@ class DeskBody(BaseModel):
     _check_portfolio = field_validator("portfolio")(_bounded_context)
 
 
+def _keep(user_id: str, body: ChatBody, reply: str, background: BackgroundTasks) -> str | None:
+    """Save the answered turn and return its chat id. History is a convenience:
+    a store that is down never costs the reply."""
+    thread_id = str(body.thread_id) if body.thread_id else None
+    question = body.messages[-1]
+    if question.role == "user":
+        try:
+            thread_id = chats.save_turn(user_id, body.thread_id, question.content, reply, body.symbol)
+            if body.thread_id is None:  # a new chat gets its short title after the reply is sent
+                background.add_task(chats.name_thread, user_id, thread_id, question.content, reply)
+        except Exception:
+            logging.getLogger(__name__).exception("chat history write failed")
+    return thread_id
+
+
+def _chat_events(user_id: str, body: ChatBody, background: BackgroundTasks):
+    """`delta` frames as the model writes, then `done` with the chat id once the
+    whole reply is saved; `error` instead if it fails (after any partial text)."""
+    parts = []
+    try:
+        for piece in ai_assistant.chat_stream([m.model_dump() for m in body.messages], body.portfolio, body.symbol):
+            parts.append(piece)
+            yield {"type": "delta", "text": piece}
+    except Exception:
+        logging.getLogger(__name__).exception("assistant stream failed")
+        yield {"type": "error", "message": ai_assistant.UNAVAILABLE}
+        return
+    reply = "".join(parts).strip()
+    if not reply:
+        yield {"type": "error", "message": ai_assistant.UNAVAILABLE}
+        return
+    # The background task runs once this stream ends (FastAPI attaches it to the response).
+    yield {"type": "done", "thread_id": _keep(user_id, body, reply, background)}
+
+
 @router.post("/ai-chat")
 def ai_chat(body: ChatBody, background: BackgroundTasks, user: Principal = Depends(limit("expensive"))):
     # Checked before the model is called, so a wrong id costs no model call.
     if body.thread_id is not None:
         chats.assert_owned(user.user_id, body.thread_id)
+    if body.stream:
+        if not ai_assistant.configured():
+            raise Unavailable("The assistant isn't configured yet.")
+        return sse(_chat_events(user.user_id, body, background))
     result = ai_assistant.chat(
         messages=[m.model_dump() for m in body.messages],
         portfolio=body.portfolio,
@@ -68,18 +109,7 @@ def ai_chat(body: ChatBody, background: BackgroundTasks, user: Principal = Depen
     )
     if "error" in result:
         raise Unavailable(result["error"])
-    # History is a convenience: a store that is down never costs the reply.
-    result["thread_id"] = str(body.thread_id) if body.thread_id else None
-    question = body.messages[-1]
-    if question.role == "user":
-        try:
-            result["thread_id"] = chats.save_turn(user.user_id, body.thread_id, question.content,
-                                                  result["reply"], body.symbol)
-            if body.thread_id is None:  # a new chat gets its short title after the reply is sent
-                background.add_task(chats.name_thread, user.user_id, result["thread_id"],
-                                    question.content, result["reply"])
-        except Exception:
-            logging.getLogger(__name__).exception("chat history write failed")
+    result["thread_id"] = _keep(user.user_id, body, result["reply"], background)
     return result
 
 

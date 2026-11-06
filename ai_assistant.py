@@ -144,47 +144,79 @@ def _build_context(portfolio: dict, symbols: list) -> str:
     return "\n\n".join(parts) if parts else "No live context available."
 
 
+UNAVAILABLE = "The assistant is unavailable right now. Try again in a moment."
+
+
+def configured() -> bool:
+    return bool(GEMINI_API_KEY or llm_router.PRIMARY)
+
+
+def _turns(messages: list, portfolio: dict | None, symbol: str | None):
+    """One question with its live context: the prompt, Gemini's history and the gateway's turns."""
+    last_text = (messages[-1].get("content") or "")[:_MAX_MESSAGE_CHARS] if messages else ""
+    symbols = list(dict.fromkeys([symbol, *_mentioned(last_text)] if symbol else _mentioned(last_text)))
+    context = _build_context(portfolio or {}, symbols)
+
+    # Gemini uses 'model' for assistant turns
+    history = []
+    for m in messages[-_MAX_HISTORY:-1]:
+        role = "model" if m.get("role") == "assistant" else "user"
+        history.append(types.Content(
+            role=role,
+            parts=[types.Part.from_text(text=(m.get("content") or "")[:_MAX_MESSAGE_CHARS])],
+        ))
+
+    prompt = f"CONTEXT (live data, cite from here):\n{context}\n\nUSER QUESTION:\n{last_text}"
+    turns = [{"role": "system", "content": SYSTEM_PROMPT}]
+    turns += [{"role": "assistant" if m.get("role") == "assistant" else "user",
+               "content": (m.get("content") or "")[:_MAX_MESSAGE_CHARS]}
+              for m in messages[-_MAX_HISTORY:-1]]
+    turns.append({"role": "user", "content": prompt})
+    return prompt, history, turns
+
+
+def _gemini_session(history: list):
+    return _client.chats.create(
+        model=MODEL,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        history=history,
+    )
+
+
 def chat(messages: list, portfolio: dict | None = None, symbol: str | None = None):
-    if not (GEMINI_API_KEY or llm_router.PRIMARY):
+    if not configured():
         return {"error": "The assistant isn't configured yet."}
 
     try:
-        last_text = (messages[-1].get("content") or "")[:_MAX_MESSAGE_CHARS] if messages else ""
-        symbols = list(dict.fromkeys([symbol, *_mentioned(last_text)] if symbol else _mentioned(last_text)))
-        context = _build_context(portfolio or {}, symbols)
-
-        # Gemini uses 'model' for assistant turns
-        history = []
-        for m in messages[-_MAX_HISTORY:-1]:
-            role = "model" if m.get("role") == "assistant" else "user"
-            history.append(types.Content(
-                role=role,
-                parts=[types.Part.from_text(text=(m.get("content") or "")[:_MAX_MESSAGE_CHARS])],
-            ))
-
-        last_user = (messages[-1].get("content") or "")[:_MAX_MESSAGE_CHARS] if messages else ""
-        prompt = f"CONTEXT (live data, cite from here):\n{context}\n\nUSER QUESTION:\n{last_user}"
-
+        prompt, history, turns = _turns(messages, portfolio, symbol)
         if llm_router.PRIMARY:
-            turns = [{"role": "system", "content": SYSTEM_PROMPT}]
-            turns += [{"role": "assistant" if m.get("role") == "assistant" else "user",
-                       "content": (m.get("content") or "")[:_MAX_MESSAGE_CHARS]}
-                      for m in messages[-_MAX_HISTORY:-1]]
-            turns.append({"role": "user", "content": prompt})
             try:
                 return {"reply": llm_router.call_chat(turns)}
             except (llm_router.RouterUnavailable, llm_router.FallbackFailed):
                 if _client is None:
                     raise  # no Gemini key to fall back to
 
-        session = _client.chats.create(
-            model=MODEL,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-            history=history,
-        )
-        response = session.send_message(prompt)
-
-        return {"reply": response.text}
+        return {"reply": _gemini_session(history).send_message(prompt).text}
     except Exception:
         logging.getLogger(__name__).exception("assistant chat failed")
-        return {"error": "The assistant is unavailable right now. Try again in a moment."}
+        return {"error": UNAVAILABLE}
+
+
+def chat_stream(messages: list, portfolio: dict | None = None, symbol: str | None = None):
+    """chat(), yielded piece by piece as the model writes it. The gateway falls
+    back to Gemini only before its first piece; after that an error ends the
+    answer where it stopped. Raises on failure: the caller words the error."""
+    prompt, history, turns = _turns(messages, portfolio, symbol)
+    if llm_router.PRIMARY:
+        sent = False
+        try:
+            for piece in llm_router.stream_chat(turns):
+                sent = True
+                yield piece
+            return
+        except (llm_router.RouterUnavailable, llm_router.FallbackFailed):
+            if sent or _client is None:
+                raise
+    for chunk in _gemini_session(history).send_message_stream(prompt):
+        if chunk.text:
+            yield chunk.text
